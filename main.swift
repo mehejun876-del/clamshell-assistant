@@ -212,7 +212,7 @@ enum Kind {
 
 final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let reminal = NSHomeDirectory() + "/.local/bin/reminal"
+    let reminal = FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.local/bin/reminal") ? NSHomeDirectory() + "/.local/bin/reminal" : Bundle.main.resourcePath! + "/reminal.app/Contents/MacOS/reminal"
     var busy = false
     var checking = false
     var current = (false, false, false, false)
