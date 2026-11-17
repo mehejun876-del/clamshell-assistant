@@ -1,10 +1,17 @@
 import Foundation
 import Darwin
+import IOKit
 
+// Reminal closed-lid settings plus the system sleep switch. Whether the bundled
+// closed-lid service runs is known locally and combined by the controller.
 struct ModeState: Equatable {
-    let closed: Bool, unlocked: Bool, power: Bool, session: Bool
-    var active: Bool { closed && unlocked && power && session }
+    let closed: Bool, unlocked: Bool, power: Bool
+    var allOn: Bool { closed && unlocked && power }
     var configured: Bool { closed || unlocked || power }
+}
+// What the menu-bar icon shows: device shape = the physical lid, status light = mode ready.
+struct Look: Hashable {
+    let lidClosed: Bool, lit: Bool
 }
 struct StatusError: LocalizedError {
     let message: String
@@ -31,7 +38,7 @@ func runCommand(_ path: String, _ args: [String], timeout: TimeInterval = 15) ->
     return (p.terminationStatus, String(decoding: data, as: UTF8.self))
 }
 
-func parseState(settings: String, power: String, sessions: String) throws -> ModeState {
+func parseState(settings: String, power: String) throws -> ModeState {
     func flag(_ key: String, in text: String, values: String) throws -> String {
         let pattern = "(?m)^\\s*" + NSRegularExpression.escapedPattern(for: key) + "\\s+(" + values + ")\\s*$"
         guard let range = text.range(of: pattern, options: .regularExpression) else {
@@ -41,16 +48,23 @@ func parseState(settings: String, power: String, sessions: String) throws -> Mod
     }
     return try ModeState(closed: flag("closed-lid", in: settings, values: "on|off") == "on",
                          unlocked: flag("always-unlocked", in: settings, values: "on|off") == "on",
-                         power: flag("SleepDisabled", in: power, values: "0|1") == "1",
-                         session: sessions.range(of: #"(?m)^\s*lid-agent\s+\S+\s+"#, options: .regularExpression) != nil)
+                         power: flag("SleepDisabled", in: power, values: "0|1") == "1")
 }
 
 func readState(reminal: String, run: (String, [String]) -> (Int32, String)) throws -> ModeState {
     let settings = run(reminal, ["settings"])
     let power = run("/usr/bin/pmset", ["-g", "live"])
-    let sessions = run(reminal, ["list", "lid-agent"])
-    for (name, result) in [("Reminal 设置", settings), ("系统睡眠状态", power), ("Reminal 后台会话", sessions)] {
+    for (name, result) in [("Reminal 设置", settings), ("系统睡眠状态", power)] {
         guard result.0 == 0 else { throw StatusError(message: name + "读取失败：" + result.1) }
     }
-    return try parseState(settings: settings.1, power: power.1, sessions: sessions.1)
+    return try parseState(settings: settings.1, power: power.1)
+}
+
+// AppleClamshellState on IOPMrootDomain: the physical lid. A Mac without a lid reads as open.
+func readLidClosed() -> Bool {
+    let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+    guard root != 0 else { return false }
+    defer { IOObjectRelease(root) }
+    return (IORegistryEntryCreateCFProperty(root, "AppleClamshellState" as CFString, kCFAllocatorDefault, 0)?
+        .takeRetainedValue() as? Bool) ?? false
 }

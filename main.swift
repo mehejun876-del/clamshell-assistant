@@ -1,4 +1,5 @@
 import AppKit
+import IOKit
 
 // 菜单栏图标：每次只显示一台设备。关闭态 = MacBook（SF Symbol macbook），开启态 = Mac Studio（SF Symbol macstudio，状态灯点亮）。
 // 切换时 MacBook 合盖，压成的扁平机身经形状插值升起、收窄成 Mac Studio 的圆角机身，前面板细节随后淡入；反向亦然。
@@ -42,10 +43,21 @@ struct Pose {
     var led: CGFloat = 0                                                   // 状态灯：0 暗，1 亮
     var halo: (r: CGFloat, a: CGFloat) = (0, 0)                            // 灯周围扩散的光环
     var alpha: CGFloat = 1, dy: CGFloat = 0                                // 整体透明度/垂直偏移（启动动画）
-    static func still(_ active: Bool) -> Pose {
+    var lapLed: CGFloat = 0                                                // 开盖时 MacBook 屏幕右下角的状态灯（与 Studio 灯同位）
+    // 外形跟随实际盖子：开盖 = MacBook，合盖 = Mac Studio；状态灯亮 = 合盖运行已就绪。
+    static func still(_ look: Look) -> Pose {
         var p = Pose()
-        if active { p.lid = 0; p.mw = 1; p.mh = 1; p.detail = 1; p.led = 1 }
+        if look.lidClosed { p.lid = 0; p.mw = 1; p.mh = 1; p.detail = 1; p.led = look.lit ? 1 : 0 }
+        else { p.lapLed = look.lit ? 1 : 0 }
         return p
+    }
+}
+
+// 真实的外接显示器（排除内建屏和 Reminal 的虚拟显示器 "reminal"）。
+func hasExternalDisplay() -> Bool {
+    NSScreen.screens.contains { screen in
+        guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else { return false }
+        return CGDisplayIsBuiltin(id) == 0 && screen.localizedName.lowercased() != "reminal"
     }
 }
 
@@ -91,6 +103,12 @@ func drawLED(_ p: Pose, _ a: CGFloat) {
     ink(a * lerp(0.45, 1, min(1, on)))
     NSBezierPath(ovalIn: NSRect(x: ledC.x - lr, y: ledC.y - lr, width: 2 * lr, height: 2 * lr)).fill()
 }
+func drawLapLED(_ p: Pose) {
+    guard p.lapLed > 0.01, p.lid > 0.9 else { return }
+    let on = min(1.1, p.lapLed), lr = lerp(0.95, 1.45, on)
+    ink(min(1, on))
+    NSBezierPath(ovalIn: NSRect(x: ledC.x - lr, y: ledC.y - lr, width: 2 * lr, height: 2 * lr)).fill()
+}
 func drawHalo(_ p: Pose) {
     guard p.halo.a > 0 else { return }
     ink(p.halo.a)
@@ -134,7 +152,7 @@ func drawScene(_ p: Pose) {
     g.saveGState(); g.setAlpha(p.alpha); g.translateBy(x: 0, y: p.dy)
     if abs(p.mw - 1) < 0.01 && abs(p.mh - 1) < 0.01 && p.detail > 0.99 { drawStudio(p) }
     else if max(p.mw, p.mh) > 1e-4 { drawMorph(p) }
-    else { drawLaptop(p) }
+    else { drawLaptop(p); drawLapLED(p); drawHalo(p) }
     g.restoreGState()
 }
 
@@ -157,51 +175,81 @@ func bitmapImage(scales: [Int], _ pose: Pose) -> NSImage {
 
 // 动画：单台设备之间的切换。τ ∈ 0...1。
 enum Kind {
-    case on, off, refresh(Bool), launch(Bool)
-    var frames: Int { switch self { case .on, .off, .launch(true): return 22; case .launch(false): return 16; case .refresh: return 17 } }
+    // close/open：盖子合上/打开时的变形（参数：起止状态灯）；led：盖子不变、合盖运行就绪状态变化。
+    case close(Bool, Bool), open(Bool, Bool), led(Bool, Bool), refresh(Look), launch(Look)
+    static let on = Kind.close(false, true), off = Kind.open(true, false)
+    var frames: Int {
+        switch self {
+        case .close, .open: return 22
+        case .launch(let look): return look.lit ? 22 : 16
+        case .refresh, .led: return 17
+        }
+    }
     var duration: Double { Double(frames) / fps }
     func pose(_ t: CGFloat) -> Pose {
         switch self {
-        case .on:
-            // MacBook 合盖（缓动 + 横向拉伸）→ 扁平机身收窄、以弹簧升起为 Mac Studio → 前面板细节淡入 → 状态灯点亮并扩散光环
+        case .close(let from, let to):
+            // MacBook 合盖（缓动 + 横向拉伸）→ 扁平机身收窄、以弹簧升起为 Mac Studio → 前面板细节淡入 → 就绪时状态灯点亮并扩散光环
             var p = Pose()
+            p.lapLed = from ? 1 - smooth(seg(t, 0, 0.12)) : 0
             p.lid = 1 - ease(seg(t, 0.03, 0.34))
             p.stretch = 0.08 * sin(.pi * seg(t, 0.03, 0.42))
             p.mw = ease(seg(t, 0.34, 0.62)); p.mh = spring(seg(t, 0.34, 0.78))
             p.detail = smooth(seg(t, 0.58, 0.78))
-            p.led = spring(seg(t, 0.72, 1.0))
-            let k = seg(t, 0.72, 0.98)
-            p.halo = (lerp(1.0, 3.5, ease(k)), 0.85 * (1 - k) * min(1, k * 8))
+            if to {
+                p.led = spring(seg(t, 0.72, 1.0))
+                let k = seg(t, 0.72, 0.98)
+                p.halo = (lerp(1.0, 3.5, ease(k)), 0.85 * (1 - k) * min(1, k * 8))
+            }
             return p
-        case .off:
-            // 状态灯收光 → 前面板细节淡出，机身压扁并展宽回 MacBook → 盖板以弹簧打开并微微拉伸后松弛
+        case .open(let from, let to):
+            // 状态灯收光 → 前面板细节淡出，机身压扁并展宽回 MacBook → 盖板以弹簧打开；就绪时屏幕角落的灯再亮起
             var p = Pose()
-            p.led = 1 - ease(seg(t, 0.03, 0.30))
-            let hk = seg(t, 0.0, 0.28)
-            p.halo = (lerp(3.0, 1.0, ease(hk)), 0.6 * sin(.pi * hk))
+            if from {
+                p.led = 1 - ease(seg(t, 0.03, 0.30))
+                let hk = seg(t, 0.0, 0.28)
+                p.halo = (lerp(3.0, 1.0, ease(hk)), 0.6 * sin(.pi * hk))
+            }
             p.detail = 1 - smooth(seg(t, 0.28, 0.46))
             p.mw = 1 - ease(seg(t, 0.34, 0.62)); p.mh = 1 - ease(seg(t, 0.30, 0.64))
             p.lid = spring(seg(t, 0.58, 0.98))
             p.stretch = 0.06 * sin(.pi * seg(t, 0.58, 0.88))
+            if to {
+                let k = seg(t, 0.80, 1.0)
+                p.lapLed = spring(k)
+                if k > 0 { p.halo = (lerp(1.0, 3.5, ease(k)), 0.8 * (1 - k) * min(1, k * 8)) }
+            }
             return p
-        case .refresh(let active):
-            // 轻微提示：Studio 状态灯闪一下并荡出一圈涟漪；MacBook 则盖板轻轻点一下头
-            var p = Pose.still(active)
-            if active {
-                p.led = 1 - 0.5 * sin(.pi * seg(t, 0.15, 0.55))
+        case .led(let closed, let on):
+            // 外形不变：状态灯点亮并荡出光环，或收光
+            var p = Pose.still(Look(lidClosed: closed, lit: false))
+            let v = on ? spring(seg(t, 0.05, 0.6)) : 1 - ease(seg(t, 0.05, 0.5))
+            if closed { p.led = v } else { p.lapLed = v }
+            if on { let k = seg(t, 0.15, 0.9); p.halo = (lerp(1.0, 3.4, ease(k)), 0.7 * (1 - k) * min(1, k * 8)) }
+            else { let k = seg(t, 0.0, 0.5); p.halo = (lerp(2.6, 1.0, ease(k)), 0.45 * sin(.pi * k)) }
+            return p
+        case .refresh(let look):
+            // 轻微提示：亮着的状态灯闪一下并荡出一圈涟漪；未就绪时 MacBook 盖板点头 / Studio 轻涟漪
+            var p = Pose.still(look)
+            if look.lit {
+                let v = 1 - 0.5 * sin(.pi * seg(t, 0.15, 0.55))
+                if look.lidClosed { p.led = v } else { p.lapLed = v }
+            }
+            if look.lit || look.lidClosed {
                 let k = seg(t, 0.30, 0.90)
-                p.halo = (lerp(1.0, 3.4, ease(k)), 0.7 * (1 - k) * min(1, k * 8))
+                p.halo = (lerp(1.0, 3.4, ease(k)), (look.lit ? 0.7 : 0.4) * (1 - k) * min(1, k * 8))
             } else {
                 p.lid = 1 - 0.10 * sin(.pi * seg(t, 0.05, 0.80))
             }
             return p
-        case .launch(let active):
-            // 开场：设备带弹簧从桌面线升起；开启态最后点亮状态灯
-            var p = Pose.still(active)
-            let u = active ? t : t * 0.72
+        case .launch(let look):
+            // 开场：设备带弹簧从桌面线升起；就绪时最后点亮状态灯
+            var p = Pose.still(look)
+            let u = look.lit ? t : t * 0.72
             p.dy = lerp(-12, 0, spring(seg(u, 0.0, 0.55))); p.alpha = smooth(seg(u, 0, 0.25))
-            if active {
-                p.led = spring(seg(t, 0.62, 0.95))
+            if look.lit {
+                let v = spring(seg(t, 0.62, 0.95))
+                if look.lidClosed { p.led = v } else { p.lapLed = v }
                 let k = seg(t, 0.62, 0.95)
                 p.halo = (lerp(1.0, 3.5, ease(k)), 0.8 * (1 - k) * min(1, k * 8))
             }
@@ -212,7 +260,16 @@ enum Kind {
 
 final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let reminal = FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.local/bin/reminal") ? NSHomeDirectory() + "/.local/bin/reminal" : Bundle.main.resourcePath! + "/reminal.app/Contents/MacOS/reminal"
+    // 始终使用随包附带、只保留合盖功能的 Reminal 精简版（不再用全局 ~/.local/bin/reminal）。
+    let reminal = Bundle.main.resourcePath! + "/reminal/reminal"
+    var service: Process?               // 精简版 `reminal service`：防睡眠 / 保持解锁 / 内屏调暗与虚拟显示器
+    var serviceInput: Pipe?             // 生命线：关闭即让服务恢复亮度、释放防睡眠后退出
+    var serviceUp = false
+    var lidClosed = false
+    var lidPort: IONotificationPortRef?
+    var lidNotification: io_object_t = 0
+    let externalKey = "ExternalDisplayWhenLidClosed"   // "keep"（默认）| "sleep"
+    var externalDisplayPresent: () -> Bool = hasExternalDisplay
     var busy = false
     var checking = false
     #if SELFTEST
@@ -227,7 +284,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var settingsWatch: DispatchSourceFileSystemObject?
     var refreshWork: DispatchWorkItem?
     var observers: [NSObjectProtocol] = []
-    var shownActive: Bool?
+    var shown: Look?
     var pingPending = false
     var link: CADisplayLink?            // 仅动画期间存在
     var overlay: NSView?                // 仅动画期间存在：盖在状态栏按钮上的图层，逐帧换 contents
@@ -235,11 +292,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ctx: CGContext?                 // 复用的绘制缓冲，结束即释放
     var started = 0.0, ticks = 0
     var pending: (Kind, Double, NSImage, (() -> Void)?)?
-    lazy var offImage: NSImage = { let i = bitmapImage(scales: [1, 2], .still(false)); i.accessibilityDescription = "正常模式"; return i }()
-    lazy var onImage: NSImage = { let i = bitmapImage(scales: [1, 2], .still(true)); i.accessibilityDescription = "合盖运行已开启"; return i }()
+    var images: [Look: NSImage] = [:]
+    func image(_ look: Look) -> NSImage {
+        if let i = images[look] { return i }
+        let i = bitmapImage(scales: [1, 2], .still(look))
+        i.accessibilityDescription = (look.lidClosed ? "已合盖" : "已开盖") + (look.lit ? "，合盖运行已就绪" : "")
+        images[look] = i; return i
+    }
     let menu = NSMenu()
     lazy var header = item("", nil)
     lazy var detail = item("", nil)
+    lazy var lidItem = item("", nil)
+    lazy var externalItem = item("合盖时外接显示器", nil)
+    lazy var externalKeep = item("保持亮着（默认）", #selector(chooseExternal(_:)))
+    lazy var externalSleep = item("熄屏，Mac 继续工作", #selector(chooseExternal(_:)))
     lazy var toggle = item("", #selector(toggleMode))
     lazy var refreshItem = item("刷新状态", #selector(refreshMenu))
     lazy var quit = item("退出菜单栏助手", #selector(quitApp), "q")
@@ -255,26 +321,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
         toggle.isEnabled = false
-        status.button?.image = offImage
+        lidClosed = readLidClosed()
+        status.button?.image = image(Look(lidClosed: lidClosed, lit: false))
         header.title = "正在读取状态…"
-        [header, detail, .separator(), toggle, refreshItem, .separator(), quit].forEach { menu.addItem($0) }
+        let sub = NSMenu(); sub.autoenablesItems = false
+        externalSleep.toolTip = "合盖约 2 秒后让显示器进入系统显示睡眠（与按下“显示器睡眠”相同，不是亮度调零）。按键、鼠标或部分远程输入会把它唤醒，助手不会反复熄灭。"
+        [externalKeep, externalSleep].forEach { sub.addItem($0) }
+        externalItem.isEnabled = true; externalItem.submenu = sub
+        [header, detail, lidItem, .separator(), toggle, externalItem, refreshItem, .separator(), quit].forEach { menu.addItem($0) }
         status.menu = menu
         #if SELFTEST
         runSelfTests(self)
         #elseif DUMP
         dumpFrames(); NSApp.terminate(nil)
         #elseif BENCH
-        status.button?.image = offImage
+        status.button?.image = image(Look(lidClosed: false, lit: false))
         benchmark(remaining: Int(ProcessInfo.processInfo.environment["BENCH_N"] ?? "12")!, target: true)
         #else
+        watchLid()
         observeChanges()
         refresh()
         #endif
     }
+    func applicationWillTerminate(_ notification: Notification) { syncService(false) }
     #if BENCH
     func benchmark(remaining: Int, target: Bool) {
         guard remaining > 0 else { NSApp.terminate(nil); return }
-        play(target ? .on : .off, final: target ? onImage : offImage) { [weak self] in self?.benchmark(remaining: remaining - 1, target: !target) }
+        play(target ? .on : .off, final: image(Look(lidClosed: target, lit: !target))) { [weak self] in self?.benchmark(remaining: remaining - 1, target: !target) }
     }
     #endif
     #if DUMP
@@ -286,10 +359,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let rep = bitmapImage(scales: [scale], pose).representations[0] as! NSBitmapImageRep
             try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: "\(dir)/\(name).png"))
         }
-        let kinds: [(String, Kind)] = [("on", .on), ("off", .off), ("refresh-off", .refresh(false)), ("refresh-on", .refresh(true)), ("launch-off", .launch(false)), ("launch-on", .launch(true))]
+        let kinds: [(String, Kind)] = [("on", .on), ("off", .off), ("close-lit", .close(true, true)), ("open-lit", .open(true, true)), ("led-open", .led(false, true)), ("led-closed", .led(true, true)),
+                                       ("refresh-off", .refresh(Look(lidClosed: false, lit: false))), ("refresh-on", .refresh(Look(lidClosed: true, lit: true))), ("launch-off", .launch(Look(lidClosed: false, lit: false))), ("launch-on", .launch(Look(lidClosed: true, lit: true)))]
         for (name, kind) in kinds { for i in 0..<kind.frames { save(kind.pose(CGFloat(i) / CGFloat(kind.frames - 1)), String(format: "\(name)-%02d", i)) } }
         for i in 0..<20 { save(Kind.on.pose(0.03 + 0.0165 * CGFloat(i)), String(format: "lid-%02d", i)) }
-        save(.still(false), "static-off"); save(.still(true), "static-on")
+        for c in [false, true] { for l in [false, true] { save(.still(Look(lidClosed: c, lit: l)), "static-\(c ? "closed" : "open")-\(l ? "lit" : "dark")") } }
     }
     #endif
     func run(_ path: String, _ args: [String]) -> (Int32, String) {
@@ -297,6 +371,60 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return testCommand(path, args)
         #else
         return runCommand(path, args, timeout: path == "/usr/bin/osascript" ? 120 : 20)
+        #endif
+    }
+    // 盖子：IOKit 合盖事件（无轮询），外形立即跟随。
+    func watchLid() {
+        guard let port = IONotificationPortCreate(kIOMainPortDefault) else { return }
+        IONotificationPortSetDispatchQueue(port, .main)
+        let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
+        guard root != 0 else { return }
+        defer { IOObjectRelease(root) }
+        IOServiceAddInterestNotification(port, root, kIOGeneralInterest, { refcon, _, type, argument in
+            guard type == 0xE003_4100, let refcon = refcon else { return }      // kIOPMMessageClamshellStateChange
+            Unmanaged<Controller>.fromOpaque(refcon).takeUnretainedValue().lidChanged(Int(bitPattern: argument) & 1 != 0)
+        }, Unmanaged.passUnretained(self).toOpaque(), &lidNotification)
+        lidPort = port
+    }
+    func lidChanged(_ closed: Bool) {
+        guard closed != lidClosed else { return }
+        lidClosed = closed
+        updateMenu()
+        if closed { applyExternalDisplayChoice() }
+    }
+    var externalSleeps: Bool { UserDefaults.standard.string(forKey: externalKey) == "sleep" }
+    var ready: Bool { lastError == nil && current?.allOn == true && serviceUp }
+    // 仅在合盖运行就绪、选了“熄屏”、确有外接显示器时，合盖后执行一次系统显示睡眠。
+    func applyExternalDisplayChoice() {
+        guard externalSleeps, ready else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self = self, self.lidClosed, self.externalSleeps, self.ready, self.externalDisplayPresent() else { return }
+            self.worker.async { _ = self.run("/usr/bin/pmset", ["displaysleepnow"]) }
+        }
+    }
+    @objc func chooseExternal(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender === externalSleep ? "sleep" : "keep", forKey: externalKey)
+        updateMenu()
+    }
+    func syncService(_ want: Bool) {
+        #if SELFTEST
+        serviceUp = want
+        #else
+        if want, service == nil {
+            let p = Process(), input = Pipe()
+            p.executableURL = URL(fileURLWithPath: reminal); p.arguments = ["service"]
+            p.standardInput = input; p.standardOutput = FileHandle.nullDevice; p.standardError = FileHandle.nullDevice
+            p.terminationHandler = { [weak self] ended in
+                DispatchQueue.main.async {
+                    guard let self = self, self.service === ended else { return }
+                    self.service = nil; self.serviceInput = nil; self.serviceUp = false; self.updateMenu()
+                }
+            }
+            do { try p.run(); service = p; serviceInput = input; serviceUp = true } catch { serviceUp = false }
+        } else if !want, service != nil {
+            service = nil; serviceUp = false
+            try? serviceInput?.fileHandleForWriting.close(); serviceInput = nil
+        }
         #endif
     }
     func state() -> Result<ModeState, Error> {
@@ -310,12 +438,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
                 // A display link may have been suspended with a blank button underneath it.
                 self.settleAnimation()
+                self.lidChanged(readLidClosed())
                 self.scheduleRefresh()
             })
         }
         observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                            object: nil, queue: .main) { [weak self] _ in
-            self?.settleAnimation(); self?.scheduleRefresh()
+            self?.settleAnimation(); self?.lidChanged(readLidClosed()); self?.scheduleRefresh()
         })
         watchSettings()
     }
@@ -350,7 +479,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         stopPlayback()
         if let final = final { status.button?.image = final }
     }
-    func image(_ active: Bool) -> NSImage { active ? onImage : offImage }
     // 播放：按显示器刷新率(60Hz)的 CADisplayLink 逐帧采样 pose(t)——缓动/弹簧曲线与时长不变——
     // 画进同一块复用的位图，再换给覆盖在按钮上的图层的 contents（不再每帧设置 NSStatusBarButton.image）。
     // 图层用位图作遮罩、按菜单栏明暗取黑/白，与模板图像着色一致。结束即停 DisplayLink、拆图层、释放缓冲，空闲零开销。
@@ -423,43 +551,55 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func accept(_ result: Result<ModeState, Error>) {
         switch result {
-        case .success(let value): current = value; lastError = nil
+        case .success(let value): current = value; lastError = nil; syncService(value.configured)
         case .failure(let error): lastError = error.localizedDescription
         }
         updateMenu()
-        // Reminal can still be restoring its session just after login/wake.
-        // A bounded recovery burst, never an idle polling timer.
-        if lastError != nil || (current?.configured == true && current?.session == false) {
+        // A bounded recovery burst after a failed read (login/wake), never an idle polling timer.
+        if lastError != nil {
             if recoveryReads > 0 { recoveryReads -= 1; enqueueRefresh(after: 1) }
         } else { recoveryReads = 0 }
+    }
+    func updateIcon() {
+        guard current != nil || lastError != nil else { return }
+        // 读取失败时不猜测：状态灯保持上次结果，外形仍按本机盖子传感器。
+        let lit = lastError == nil ? ready : (shown?.lit ?? false)
+        let target = Look(lidClosed: lidClosed, lit: lit)
+        guard let from = shown else { play(.launch(target), final: image(target)); shown = target; pingPending = false; return }
+        if from == target {
+            if pingPending && link == nil { play(.refresh(target), final: image(target)) }
+            pingPending = false; return
+        }
+        // Finish the current single-device morph, then play the latest target.
+        if link != nil { pending?.3 = { [weak self] in self?.updateIcon() }; return }
+        let kind: Kind = from.lidClosed != target.lidClosed
+            ? (target.lidClosed ? .close(from.lit, target.lit) : .open(from.lit, target.lit))
+            : .led(target.lidClosed, target.lit)
+        play(kind, final: image(target)); shown = target; pingPending = false
     }
     func updateMenu() {
         toggle.isEnabled = !busy && current != nil && lastError == nil
         refreshItem.isEnabled = !busy
+        externalKeep.state = externalSleeps ? .off : .on
+        externalSleep.state = externalSleeps ? .on : .off
+        lidItem.title = lidClosed ? "盖子：已合上" : "盖子：已打开"
+        updateIcon()
         if busy { header.title = "正在切换…"; return }
         if let error = lastError {
             header.title = "状态暂不可用"
-            detail.title = "读取失败，保留上次图标；请刷新重试"
+            detail.title = "读取失败，状态灯保持上次结果；请刷新重试"
             status.button?.toolTip = "合盖助手：" + error
             return
         }
         guard let current = current else { return }
-        let active = current.active
-        if let previous = shownActive {
-            if previous != active {
-                // Finish the current single-device morph, then play the latest target.
-                // State refreshes cannot restart an in-flight animation from the wrong endpoint.
-                if link != nil {
-                    pending?.3 = { [weak self] in self?.updateMenu() }
-                    return
-                }
-                play(active ? .on : .off, final: image(active))
-            } else if pingPending && link == nil { play(.refresh(active), final: image(active)) }
-        } else { play(.launch(active), final: image(active)) }
-        pingPending = false; shownActive = active
-        status.button?.toolTip = active ? "合盖助手：合盖设置和后台会话已就绪（未验证实际合盖）" : "合盖助手：正常模式或设置未完全就绪"
-        header.title = active ? "合盖运行已就绪" : (current.configured ? "合盖运行未完全就绪" : "正常合盖睡眠")
-        detail.title = active ? "后台会话存在；同时已开启保持解锁" : (current.configured ? "部分设置开启，请关闭后重试或刷新" : "合上盖子恢复系统默认行为")
+        var missing: [String] = []
+        if !current.power { missing.append("系统禁睡眠") }
+        if !current.closed { missing.append("closed-lid") }
+        if !current.unlocked { missing.append("保持解锁") }
+        if !serviceUp { missing.append("合盖服务") }
+        status.button?.toolTip = "合盖助手：外形表示盖子实际状态，状态灯亮表示合盖运行已就绪"
+        header.title = ready ? "合盖运行已就绪" : (current.configured ? "合盖运行未完全就绪" : "正常模式（合盖会睡眠）")
+        detail.title = ready ? "合盖后 Mac 继续工作；已开启保持解锁" : (current.configured ? "未就绪：" + missing.joined(separator: "、") : "合上盖子恢复系统默认行为")
         toggle.title = current.configured ? "关闭合盖运行" : "开启合盖运行"
     }
     func menuWillOpen(_ menu: NSMenu) { refresh() }
@@ -490,16 +630,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let closedResult = self.run(self.reminal, ["settings", "closed-lid", mode])
                 let unlockResult = self.run(self.reminal, ["settings", "always-unlocked", mode])
                 if closedResult.0 != 0 || unlockResult.0 != 0 { error = "Reminal 设置未能保存，请刷新状态后重试。" }
-                if enable {
-                    let sessions = self.run(self.reminal, ["list", "lid-agent"])
-                    if sessions.0 != 0 { error = "无法读取后台会话；未创建重复会话，请刷新后重试。" }
-                    else if sessions.1.range(of: #"(?m)^\s*lid-agent\s+\S+\s+"#, options: .regularExpression) == nil {
-                        if self.run(self.reminal, ["new", "lid-agent"]).0 != 0 { error = "后台会话启动失败，请检查网络后重试。" }
-                    }
-                }
                 switch self.state() {
                 case .success(let actual):
-                    if enable && !actual.active { error = "部分设置未生效，请刷新状态后重试。" }
+                    if enable && !actual.allOn { error = "部分设置未生效，请刷新状态后重试。" }
                     if !enable && actual.configured { error = "部分设置未能关闭，请刷新状态后重试。" }
                 case .failure(let failure): error = failure.localizedDescription
                 }
