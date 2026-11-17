@@ -1,3 +1,4 @@
+build/
 ClamshellAssistant
 *.app
-.DS_Store
+*.zip

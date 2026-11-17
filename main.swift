@@ -215,7 +215,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let reminal = FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.local/bin/reminal") ? NSHomeDirectory() + "/.local/bin/reminal" : Bundle.main.resourcePath! + "/reminal.app/Contents/MacOS/reminal"
     var busy = false
     var checking = false
-    var current = (false, false, false, false)
+    #if SELFTEST
+    var testCommand: ((String, [String]) -> (Int32, String))!
+    #endif
+    let worker = DispatchQueue(label: "local.reminal.clamshellassistant.commands", qos: .utility)
+    var generation = 0
+    var refreshPending = false
+    var recoveryReads = 3
+    var lastError: String?
+    var current: ModeState?
+    var settingsWatch: DispatchSourceFileSystemObject?
+    var refreshWork: DispatchWorkItem?
+    var observers: [NSObjectProtocol] = []
     var shownActive: Bool?
     var pingPending = false
     var link: CADisplayLink?            // 仅动画期间存在
@@ -242,14 +253,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         status.button?.imagePosition = .imageOnly
         menu.delegate = self
+        menu.autoenablesItems = false
+        toggle.isEnabled = false
+        status.button?.image = offImage
+        header.title = "正在读取状态…"
         [header, detail, .separator(), toggle, refreshItem, .separator(), quit].forEach { menu.addItem($0) }
         status.menu = menu
-        #if DUMP
+        #if SELFTEST
+        runSelfTests(self)
+        #elseif DUMP
         dumpFrames(); NSApp.terminate(nil)
         #elseif BENCH
         status.button?.image = offImage
         benchmark(remaining: Int(ProcessInfo.processInfo.environment["BENCH_N"] ?? "12")!, target: true)
         #else
+        observeChanges()
         refresh()
         #endif
     }
@@ -275,17 +293,62 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     #endif
     func run(_ path: String, _ args: [String]) -> (Int32, String) {
-        let p = Process(); p.executableURL = URL(fileURLWithPath: path); p.arguments = args
-        let output = Pipe(); p.standardOutput = output; p.standardError = output
-        p.standardInput = FileHandle.nullDevice
-        do { try p.run(); let data = output.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit(); return (p.terminationStatus, String(decoding: data, as: UTF8.self)) }
-        catch { return (1, error.localizedDescription) }
+        #if SELFTEST
+        return testCommand(path, args)
+        #else
+        return runCommand(path, args, timeout: path == "/usr/bin/osascript" ? 120 : 20)
+        #endif
     }
-    func state() -> (Bool, Bool, Bool, Bool) {
-        let s = run(reminal, ["settings"]).1
-        let power = run("/usr/bin/pmset", ["-g", "live"]).1
-        let sessions = run(reminal, ["list", "lid-agent"]).1
-        return (s.contains("closed-lid           on"), s.contains("always-unlocked      on"), power.contains("SleepDisabled\t\t1"), sessions.range(of: #"(?m)^\s*lid-agent\s+\S+\s+"#, options: .regularExpression) != nil)
+    func state() -> Result<ModeState, Error> {
+        Result { try readState(reminal: reminal, run: run) }
+    }
+    func observeChanges() {
+        let workspace = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification,
+                     NSWorkspace.sessionDidBecomeActiveNotification] {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                // A display link may have been suspended with a blank button underneath it.
+                self.settleAnimation()
+                self.scheduleRefresh()
+            })
+        }
+        observers.append(NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                           object: nil, queue: .main) { [weak self] _ in
+            self?.settleAnimation(); self?.scheduleRefresh()
+        })
+        watchSettings()
+    }
+    func watchSettings() {
+        settingsWatch?.cancel(); settingsWatch = nil
+        let fd = open(NSHomeDirectory() + "/.reminal/settings.json", O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
+            eventMask: [.write, .rename, .delete], queue: .main)
+        source.setCancelHandler { close(fd) }
+        source.setEventHandler { [weak self, weak source] in
+            guard let self = self else { return }
+            if source?.data.contains(.rename) == true || source?.data.contains(.delete) == true {
+                self.watchSettings()
+            }
+            self.scheduleRefresh()
+        }
+        settingsWatch = source; source.resume()
+    }
+    func scheduleRefresh() {
+        recoveryReads = 3
+        enqueueRefresh(after: 0.3)
+    }
+    func enqueueRefresh(after delay: Double) {
+        refreshWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refresh() }
+        refreshWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+    func settleAnimation() {
+        let final = pending?.2
+        stopPlayback()
+        if let final = final { status.button?.image = final }
     }
     func image(_ active: Bool) -> NSImage { active ? onImage : offImage }
     // 播放：按显示器刷新率(60Hz)的 CADisplayLink 逐帧采样 pose(t)——缓动/弹簧曲线与时长不变——
@@ -320,7 +383,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func tick(_ link: CADisplayLink) {
         guard let (kind, duration, final, completion) = pending, let c = ctx, let mask = maskLayer else { return }
-        let t = (link.targetTimestamp - started) / duration
+        let t = (max(CACurrentMediaTime(), link.targetTimestamp) - started) / duration
         if t >= 1 {
             stopPlayback(); status.button?.image = final
             #if BENCH
@@ -345,41 +408,69 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         overlay?.removeFromSuperview(); overlay = nil; maskLayer = nil; ctx = nil; pending = nil
     }
     func refresh() {
-        guard !busy, !checking else { return }
-        checking = true
-        DispatchQueue.global(qos: .utility).async {
+        guard !busy, !checking else { refreshPending = true; return }
+        checking = true; refreshPending = false
+        let revision = generation
+        worker.async {
             let result = self.state()
             DispatchQueue.main.async {
                 self.checking = false
-                guard !self.busy else { return }
-                self.current = result
-                self.updateMenu()
+                // A pre-toggle read must never overwrite the post-toggle state.
+                if revision == self.generation && !self.busy { self.accept(result) }
+                if self.refreshPending && !self.busy { self.refresh() }
             }
         }
     }
-    func updateMenu() {
-        let (closed, unlocked, power, session) = current
-        let active = closed && unlocked && power && session
-        if let previous = shownActive {
-            if previous != active { play(active ? .on : .off, final: image(active)) }
-            else if pingPending && link == nil { play(.refresh(active), final: image(active)) }
-        } else {
-            play(.launch(active), final: image(active))
+    func accept(_ result: Result<ModeState, Error>) {
+        switch result {
+        case .success(let value): current = value; lastError = nil
+        case .failure(let error): lastError = error.localizedDescription
         }
-        pingPending = false
-        shownActive = active
-        status.button?.toolTip = active ? "合盖助手：允许合盖运行" : "合盖助手：正常模式或合盖运行未就绪"
-        header.title = active ? "允许合盖运行" : "正常模式"
-        detail.title = active ? "Agent 可继续工作" : "合上盖子可能会睡眠"
-        toggle.title = active || closed || power ? "关闭合盖运行" : "开启合盖运行"
+        updateMenu()
+        // Reminal can still be restoring its session just after login/wake.
+        // A bounded recovery burst, never an idle polling timer.
+        if lastError != nil || (current?.configured == true && current?.session == false) {
+            if recoveryReads > 0 { recoveryReads -= 1; enqueueRefresh(after: 1) }
+        } else { recoveryReads = 0 }
+    }
+    func updateMenu() {
+        toggle.isEnabled = !busy && current != nil && lastError == nil
+        refreshItem.isEnabled = !busy
+        if busy { header.title = "正在切换…"; return }
+        if let error = lastError {
+            header.title = "状态暂不可用"
+            detail.title = "读取失败，保留上次图标；请刷新重试"
+            status.button?.toolTip = "合盖助手：" + error
+            return
+        }
+        guard let current = current else { return }
+        let active = current.active
+        if let previous = shownActive {
+            if previous != active {
+                // Finish the current single-device morph, then play the latest target.
+                // State refreshes cannot restart an in-flight animation from the wrong endpoint.
+                if link != nil {
+                    pending?.3 = { [weak self] in self?.updateMenu() }
+                    return
+                }
+                play(active ? .on : .off, final: image(active))
+            } else if pingPending && link == nil { play(.refresh(active), final: image(active)) }
+        } else { play(.launch(active), final: image(active)) }
+        pingPending = false; shownActive = active
+        status.button?.toolTip = active ? "合盖助手：合盖设置和后台会话已就绪（未验证实际合盖）" : "合盖助手：正常模式或设置未完全就绪"
+        header.title = active ? "合盖运行已就绪" : (current.configured ? "合盖运行未完全就绪" : "正常合盖睡眠")
+        detail.title = active ? "后台会话存在；同时已开启保持解锁" : (current.configured ? "部分设置开启，请关闭后重试或刷新" : "合上盖子恢复系统默认行为")
+        toggle.title = current.configured ? "关闭合盖运行" : "开启合盖运行"
     }
     func menuWillOpen(_ menu: NSMenu) { refresh() }
     @objc func refreshMenu() { pingPending = !busy && !checking; refresh() }
     @objc func quitApp() { NSApp.terminate(nil) }
     @objc func toggleMode() {
-        let (closed, _, power, _) = current; let enable = !(closed || power)
-        busy = true; status.button?.toolTip = "正在切换…"
-        DispatchQueue.global(qos: .userInitiated).async {
+        guard !busy, let current = current, lastError == nil else { return }
+        let enable = !current.configured
+        generation += 1
+        busy = true; updateMenu(); status.button?.toolTip = "正在切换…"
+        worker.async {
             let value = enable ? "1" : "0"
             // The first authorization installs a rule limited to these two pmset commands.
             var auth = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value])
@@ -399,15 +490,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let closedResult = self.run(self.reminal, ["settings", "closed-lid", mode])
                 let unlockResult = self.run(self.reminal, ["settings", "always-unlocked", mode])
                 if closedResult.0 != 0 || unlockResult.0 != 0 { error = "Reminal 设置未能保存，请刷新状态后重试。" }
-                if enable && self.run(self.reminal, ["list", "lid-agent"]).1.range(of: #"(?m)^\s*lid-agent\s+\S+\s+"#, options: .regularExpression) == nil {
-                    if self.run(self.reminal, ["new", "lid-agent"]).0 != 0 { error = "后台会话启动失败，请检查网络后重试。" }
+                if enable {
+                    let sessions = self.run(self.reminal, ["list", "lid-agent"])
+                    if sessions.0 != 0 { error = "无法读取后台会话；未创建重复会话，请刷新后重试。" }
+                    else if sessions.1.range(of: #"(?m)^\s*lid-agent\s+\S+\s+"#, options: .regularExpression) == nil {
+                        if self.run(self.reminal, ["new", "lid-agent"]).0 != 0 { error = "后台会话启动失败，请检查网络后重试。" }
+                    }
                 }
-                let actual = self.state()
-                if enable && !(actual.0 && actual.1 && actual.2 && actual.3) { error = "部分设置未生效，请刷新状态后重试。" }
-                if !enable && (actual.0 || actual.1 || actual.2) { error = "部分设置未能关闭，请刷新状态后重试。" }
+                switch self.state() {
+                case .success(let actual):
+                    if enable && !actual.active { error = "部分设置未生效，请刷新状态后重试。" }
+                    if !enable && actual.configured { error = "部分设置未能关闭，请刷新状态后重试。" }
+                case .failure(let failure): error = failure.localizedDescription
+                }
             } else if !auth.1.contains("User canceled") && !auth.1.contains("用户取消") { error = "无法更改系统睡眠设置：\n" + auth.1 }
             DispatchQueue.main.async {
-                self.busy = false; self.refresh()
+                self.busy = false; self.updateMenu(); self.refresh()
                 if let error = error { let a = NSAlert(); a.messageText = "切换未完成"; a.informativeText = error; a.runModal() }
             }
         }
