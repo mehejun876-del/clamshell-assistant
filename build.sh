@@ -12,9 +12,14 @@ else (cd $SRC && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -trimpath -ldfl
 swiftc -O -target arm64-apple-macosx14.0 $SRC/native/reminal-capture/main.swift -o build/reminal-capture
 swiftc -Osize -wmo main.swift State.swift -o build/ClamshellAssistant -Xlinker -dead_strip
 strip -x build/ClamshellAssistant
+if [[ ! -f AppIcon.icns ]]; then
+  swiftc tools/make-app-icon.swift -o build/make-app-icon
+  build/make-app-icon "$PWD/AppIcon.icns"
+fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/reminal" "$APP/Contents/Resources/ThirdParty"
 cp Info.plist "$APP/Contents/Info.plist"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 mv -f build/ClamshellAssistant "$APP/Contents/MacOS/ClamshellAssistant"
 mv -f build/reminal build/reminal-capture "$APP/Contents/Resources/reminal/"
 cp LICENSE THIRD_PARTY_NOTICES.md "$APP/Contents/Resources/"
