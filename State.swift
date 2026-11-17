@@ -9,7 +9,30 @@ struct ModeState: Equatable {
     var allOn: Bool { closed && unlocked && power }
     var configured: Bool { closed || unlocked || power }
 }
-// What the menu-bar icon shows: device shape = the physical lid, status light = mode ready.
+// One interpretation of a successfully read settings + power snapshot. A partial
+// configuration is NOT an enabled mode; it offers both repair and an explicit off.
+struct ModePresentation {
+    enum Phase { case off, partial, ready }
+    let state: ModeState
+    let serviceUp: Bool
+    var phase: Phase { state.allOn && serviceUp ? .ready : (state.configured ? .partial : .off) }
+    var isReady: Bool { phase == .ready }
+    var look: Look { Look(lidClosed: state.closed, lit: isReady) }
+    var primaryEnables: Bool { !isReady }
+    var primaryTitle: String { phase == .ready ? "关闭合盖运行" : (phase == .partial ? "完成开启／修复合盖运行" : "开启合盖运行") }
+    var offersDisable: Bool { phase == .partial }
+    var missing: [String] {
+        var result: [String] = []
+        if !state.power { result.append("系统禁睡眠") }
+        if !state.closed { result.append("closed-lid") }
+        if !state.unlocked { result.append("保持解锁") }
+        if !serviceUp { result.append("合盖服务") }
+        return result
+    }
+    var header: String { phase == .ready ? "合盖运行已就绪" : (phase == .partial ? "合盖运行仅部分开启（未就绪）" : "正常模式（合盖会睡眠）") }
+    var detail: String { phase == .ready ? "合盖后 Mac 继续工作；已开启保持解锁" : (phase == .partial ? "未就绪：" + missing.joined(separator: "、") : "合上盖子恢复系统默认行为") }
+}
+// Device shape = closed-lid setting; light = all required parts ready.
 struct Look: Hashable {
     let lidClosed: Bool, lit: Bool
 }

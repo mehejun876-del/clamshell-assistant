@@ -11,6 +11,16 @@ func runSelfTests(_ c: Controller) {
         let live = try! readState(reminal: ProcessInfo.processInfo.environment["LIVE_REMINAL"] ?? c.reminal) { runCommand($0, $1) }
         print("PASS passive live read: closed-lid=\(live.closed) unlocked=\(live.unlocked) sleepDisabled=\(live.power) lidClosed=\(readLidClosed()) external=\(hasExternalDisplay())")
     }
+    let screenshot = ModeState(closed: false, unlocked: false, power: true)
+    let screenshotUI = ModePresentation(state: screenshot, serviceUp: true)
+    check(screenshotUI.phase == .partial && screenshotUI.primaryEnables && screenshotUI.offersDisable && screenshotUI.look == Look(lidClosed: false, lit: false), "screenshot regression: SleepDisabled alone means partial + repair AND off, never enabled")
+    for bits in 0..<8 {
+        for service in [false, true] {
+            let state = ModeState(closed: bits & 1 != 0, unlocked: bits & 2 != 0, power: bits & 4 != 0)
+            let ui = ModePresentation(state: state, serviceUp: service)
+            check(ui.isReady == (bits == 7 && service) && ui.look.lit == ui.isReady && ui.look.lidClosed == state.closed && ui.primaryEnables == !ui.isReady && ui.offersDisable == (state.configured && !ui.isReady), "one snapshot drives shape, readiness and both actions")
+        }
+    }
     let off = ModeState(closed: false, unlocked: false, power: false)
     let on = ModeState(closed: true, unlocked: true, power: true)
     let parsed = try! parseState(settings: "reminal settings:\n closed-lid\t on\n always-unlocked    on\n", power: " SleepDisabled  1\n")
@@ -56,7 +66,9 @@ func runSelfTests(_ c: Controller) {
     }
     UserDefaults.standard.removeObject(forKey: c.externalKey)
     check(!c.externalSleeps, "external display choice defaults to keep on")
-    c.current = off; c.shown = Look(lidClosed: false, lit: false)
+    c.current = screenshot; c.shown = Look(lidClosed: false, lit: false)
+    c.updateMenu()
+    check(c.toggle.title == "完成开启／修复合盖运行" && !c.disablePartial.isHidden && c.detail.title.contains("closed-lid、保持解锁"), "screenshot menu offers repair and close without contradicting laptop icon")
     c.refresh()
     c.toggleMode(); c.toggleMode(); c.toggleMode()
     for _ in 0..<100 { c.refresh() }
@@ -119,7 +131,13 @@ func runSelfTests(_ c: Controller) {
                             c.accept(.success(ModeState(closed: true, unlocked: false, power: false)))
                             check(c.shown == Look(lidClosed: true, lit: false) && c.detail.title.contains("未就绪"), "closed-lid setting alone selects Studio; missing readiness honestly reported")
                             print("PASS \(assertions) assertions; rendered close=\(c.renderedCloseFrames), open=\(c.renderedOpenFrames), halo=\(c.renderedHaloFrames); real status-button animation path, mocked writes only")
-                            NSApp.terminate(nil)
+                            c.settleAnimation(); c.accept(.success(screenshot)); c.settleAnimation()
+                            c.disableMode()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                check(writes == 9 && c.current == off && c.disablePartial.isHidden && c.toggle.title == "开启合盖运行", "partial-state explicit OFF reaches all-off without repairing first")
+                                print("PASS final \(assertions) assertions including both partial-state actions")
+                                NSApp.terminate(nil)
+                            }
                         }
                     }
                 }

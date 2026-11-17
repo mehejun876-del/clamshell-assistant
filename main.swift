@@ -308,6 +308,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     lazy var externalKeep = item("保持亮着（默认）", #selector(chooseExternal(_:)))
     lazy var externalSleep = item("熄屏，Mac 继续工作", #selector(chooseExternal(_:)))
     lazy var toggle = item("", #selector(toggleMode))
+    lazy var disablePartial = item("关闭全部合盖设置", #selector(disableMode))
     lazy var refreshItem = item("刷新状态", #selector(refreshMenu))
     lazy var quit = item("退出菜单栏助手", #selector(quitApp), "q")
 
@@ -329,7 +330,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         externalSleep.toolTip = "合盖约 2 秒后让显示器进入系统显示睡眠（与按下“显示器睡眠”相同，不是亮度调零）。按键、鼠标或部分远程输入会把它唤醒，助手不会反复熄灭。"
         [externalKeep, externalSleep].forEach { sub.addItem($0) }
         externalItem.isEnabled = true; externalItem.submenu = sub
-        [header, detail, lidItem, .separator(), toggle, externalItem, refreshItem, .separator(), quit].forEach { menu.addItem($0) }
+        [header, detail, lidItem, .separator(), toggle, disablePartial, externalItem, refreshItem, .separator(), quit].forEach { menu.addItem($0) }
         status.menu = menu
         #if SELFTEST
         runSelfTests(self)
@@ -394,7 +395,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if closed { applyExternalDisplayChoice() }
     }
     var externalSleeps: Bool { UserDefaults.standard.string(forKey: externalKey) == "sleep" }
-    var ready: Bool { lastError == nil && current?.allOn == true && serviceUp }
+    var presentation: ModePresentation? { current.map { ModePresentation(state: $0, serviceUp: serviceUp) } }
+    var ready: Bool { lastError == nil && presentation?.isReady == true }
     // 仅在合盖运行就绪、选了“熄屏”、确有外接显示器时，合盖后执行一次系统显示睡眠。
     func applyExternalDisplayChoice() {
         guard externalSleeps, ready else { return }
@@ -567,13 +569,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if recoveryReads > 0 { recoveryReads -= 1; enqueueRefresh(after: 1) }
         } else { recoveryReads = 0 }
     }
-    func updateIcon() {
+    func updateIcon(_ snapshot: ModePresentation? = nil) {
         guard current != nil || lastError != nil else { return }
         // 外形表示 closed-lid 模式，不把物理盖子或全部就绪条件当作变形前提。
         // 读取失败时外形和灯均保留上次结果，菜单明确报错。
-        let lit = lastError == nil ? ready : (shown?.lit ?? false)
-        let modeOn = lastError == nil ? (current?.closed ?? false) : (shown?.lidClosed ?? false)
-        let target = Look(lidClosed: modeOn, lit: lit)
+        let target = lastError == nil
+            ? ((snapshot ?? presentation)?.look ?? Look(lidClosed: false, lit: false))
+            : (shown ?? Look(lidClosed: false, lit: false))
         guard let from = shown else { play(.launch(target), final: image(target)); shown = target; pingPending = false; return }
         if from == target {
             if pingPending && link == nil { play(.refresh(target), final: image(target)) }
@@ -587,12 +589,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         play(kind, final: image(target)); shown = target; pingPending = false
     }
     func updateMenu() {
-        toggle.isEnabled = !busy && current != nil && lastError == nil
+        let snapshot = presentation
+        toggle.isEnabled = !busy && snapshot != nil && lastError == nil
+        disablePartial.isEnabled = toggle.isEnabled
+        disablePartial.isHidden = lastError != nil || snapshot?.offersDisable != true
         refreshItem.isEnabled = !busy
         externalKeep.state = externalSleeps ? .off : .on
         externalSleep.state = externalSleeps ? .on : .off
         lidItem.title = lidClosed ? "盖子：已合上" : "盖子：已打开"
-        updateIcon()
+        updateIcon(snapshot)
         if busy { header.title = "正在切换…"; return }
         if let error = lastError {
             header.title = "状态暂不可用"
@@ -600,23 +605,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             status.button?.toolTip = "合盖助手：" + error
             return
         }
-        guard let current = current else { return }
-        var missing: [String] = []
-        if !current.power { missing.append("系统禁睡眠") }
-        if !current.closed { missing.append("closed-lid") }
-        if !current.unlocked { missing.append("保持解锁") }
-        if !serviceUp { missing.append("合盖服务") }
-        status.button?.toolTip = "合盖助手：主机表示已开启合盖模式，笔记本表示未开启；灯亮表示全部就绪；实际盖子状态见菜单"
-        header.title = ready ? "合盖运行已就绪" : (current.configured ? "合盖运行未完全就绪" : "正常模式（合盖会睡眠）")
-        detail.title = ready ? "合盖后 Mac 继续工作；已开启保持解锁" : (current.configured ? "未就绪：" + missing.joined(separator: "、") : "合上盖子恢复系统默认行为")
-        toggle.title = current.configured ? "关闭合盖运行" : "开启合盖运行"
+        guard let snapshot = snapshot else { return }
+        status.button?.toolTip = "合盖助手：主机表示 closed-lid 已开，灯亮才表示全部就绪；部分开启请修复或关闭；实际盖子状态见菜单"
+        header.title = snapshot.header
+        detail.title = snapshot.detail
+        toggle.title = snapshot.primaryTitle
     }
     func menuWillOpen(_ menu: NSMenu) { refresh() }
     @objc func refreshMenu() { pingPending = !busy && !checking; refresh() }
     @objc func quitApp() { NSApp.terminate(nil) }
     @objc func toggleMode() {
-        guard !busy, let current = current, lastError == nil else { return }
-        let enable = !current.configured
+        guard let snapshot = presentation else { return }
+        setMode(snapshot.primaryEnables)
+    }
+    @objc func disableMode() { setMode(false) }
+    func setMode(_ enable: Bool) {
+        guard !busy, current != nil, lastError == nil else { return }
         generation += 1
         busy = true; updateMenu(); status.button?.toolTip = "正在切换…"
         worker.async {
