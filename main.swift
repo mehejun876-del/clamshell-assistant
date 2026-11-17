@@ -175,7 +175,7 @@ func bitmapImage(scales: [Int], _ pose: Pose) -> NSImage {
 
 // 动画：单台设备之间的切换。τ ∈ 0...1。
 enum Kind {
-    // close/open：盖子合上/打开时的变形（参数：起止状态灯）；led：盖子不变、合盖运行就绪状态变化。
+    // close/open：模式启用/关闭时的原始变形（参数：起止状态灯）；led：模式不变、就绪状态变化。
     case close(Bool, Bool), open(Bool, Bool), led(Bool, Bool), refresh(Look), launch(Look)
     static let on = Kind.close(false, true), off = Kind.open(true, false)
     var frames: Int {
@@ -274,6 +274,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var checking = false
     #if SELFTEST
     var testCommand: ((String, [String]) -> (Int32, String))!
+    var renderedCloseFrames = 0, renderedOpenFrames = 0, renderedHaloFrames = 0
     #endif
     let worker = DispatchQueue(label: "local.reminal.clamshellassistant.commands", qos: .utility)
     var generation = 0
@@ -296,7 +297,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func image(_ look: Look) -> NSImage {
         if let i = images[look] { return i }
         let i = bitmapImage(scales: [1, 2], .still(look))
-        i.accessibilityDescription = (look.lidClosed ? "已合盖" : "已开盖") + (look.lit ? "，合盖运行已就绪" : "")
+        i.accessibilityDescription = (look.lidClosed ? "合盖运行模式" : "正常模式") + (look.lit ? "，合盖运行已就绪" : "")
         images[look] = i; return i
     }
     let menu = NSMenu()
@@ -322,7 +323,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.autoenablesItems = false
         toggle.isEnabled = false
         lidClosed = readLidClosed()
-        status.button?.image = image(Look(lidClosed: lidClosed, lit: false))
+        status.button?.image = image(Look(lidClosed: false, lit: false))
         header.title = "正在读取状态…"
         let sub = NSMenu(); sub.autoenablesItems = false
         externalSleep.toolTip = "合盖约 2 秒后让显示器进入系统显示睡眠（与按下“显示器睡眠”相同，不是亮度调零）。按键、鼠标或部分远程输入会把它唤醒，助手不会反复熄灭。"
@@ -524,7 +525,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             c.clear(CGRect(x: 0, y: 0, width: CGFloat(c.width), height: CGFloat(c.height)))
             NSGraphicsContext.saveGraphicsState()
             NSGraphicsContext.current = NSGraphicsContext(cgContext: c, flipped: false)
-            drawScene(kind.pose(CGFloat(max(0, t))))
+            let pose = kind.pose(CGFloat(max(0, t)))
+            drawScene(pose)
+            #if SELFTEST
+            if case .close = kind { renderedCloseFrames += 1 }
+            if case .open = kind { renderedOpenFrames += 1 }
+            if pose.halo.1 > 0 { renderedHaloFrames += 1 }
+            #endif
             NSGraphicsContext.restoreGraphicsState()
             CATransaction.begin(); CATransaction.setDisableActions(true)
             mask.contents = c.makeImage()
@@ -562,9 +569,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func updateIcon() {
         guard current != nil || lastError != nil else { return }
-        // 读取失败时不猜测：状态灯保持上次结果，外形仍按本机盖子传感器。
+        // 外形表示 closed-lid 模式，不把物理盖子或全部就绪条件当作变形前提。
+        // 读取失败时外形和灯均保留上次结果，菜单明确报错。
         let lit = lastError == nil ? ready : (shown?.lit ?? false)
-        let target = Look(lidClosed: lidClosed, lit: lit)
+        let modeOn = lastError == nil ? (current?.closed ?? false) : (shown?.lidClosed ?? false)
+        let target = Look(lidClosed: modeOn, lit: lit)
         guard let from = shown else { play(.launch(target), final: image(target)); shown = target; pingPending = false; return }
         if from == target {
             if pingPending && link == nil { play(.refresh(target), final: image(target)) }
@@ -587,7 +596,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if busy { header.title = "正在切换…"; return }
         if let error = lastError {
             header.title = "状态暂不可用"
-            detail.title = "读取失败，状态灯保持上次结果；请刷新重试"
+            detail.title = "读取失败，图标保持上次结果；请刷新重试"
             status.button?.toolTip = "合盖助手：" + error
             return
         }
@@ -597,7 +606,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !current.closed { missing.append("closed-lid") }
         if !current.unlocked { missing.append("保持解锁") }
         if !serviceUp { missing.append("合盖服务") }
-        status.button?.toolTip = "合盖助手：外形表示盖子实际状态，状态灯亮表示合盖运行已就绪"
+        status.button?.toolTip = "合盖助手：主机表示已开启合盖模式，笔记本表示未开启；灯亮表示全部就绪；实际盖子状态见菜单"
         header.title = ready ? "合盖运行已就绪" : (current.configured ? "合盖运行未完全就绪" : "正常模式（合盖会睡眠）")
         detail.title = ready ? "合盖后 Mac 继续工作；已开启保持解锁" : (current.configured ? "未就绪：" + missing.joined(separator: "、") : "合上盖子恢复系统默认行为")
         toggle.title = current.configured ? "关闭合盖运行" : "开启合盖运行"

@@ -30,7 +30,7 @@ func runSelfTests(_ c: Controller) {
     let large = runCommand("/usr/bin/awk", ["BEGIN { for(i=0;i<100000;i++) print \"0123456789\" }"])
     check(large.0 == 0 && large.1.utf8.count == 1100000, "large output cannot fill a pipe")
 
-    // Pose semantics: shape = physical lid, light = ready.
+    // Pose semantics: shape = closed-lid mode, light = ready.
     check(Pose.still(Look(lidClosed: true, lit: false)).mw == 1 && Pose.still(Look(lidClosed: true, lit: false)).led == 0, "closed lid shows Studio, dark light")
     check(Pose.still(Look(lidClosed: false, lit: true)).mw == 0 && Pose.still(Look(lidClosed: false, lit: true)).lapLed == 1, "open lid shows MacBook, lit light")
     for kind in [Kind.close(true, false), .close(false, true), .open(true, false), .open(false, true), .led(true, true), .led(false, false)] {
@@ -61,23 +61,28 @@ func runSelfTests(_ c: Controller) {
     c.toggleMode(); c.toggleMode(); c.toggleMode()
     for _ in 0..<100 { c.refresh() }
     check(c.busy && !c.toggle.isEnabled, "toggle guarded during mutation")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+        check(c.overlay?.superview === c.status.button && c.link != nil && c.maskLayer?.contents != nil && c.ticks > 1, "toggle enable has attached overlay, live displaylink and rendered mask")
+        if case .close = c.pending?.0 {} else { check(false, "enable must use full close morph, not just LED") }
+    }
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
         check(writes == 3, "rapid clicks cause exactly one mode operation (mocked)")
         check(commands < 20, "refresh requests coalesced")
         check(c.current == on && c.serviceUp && c.ready, "enable starts closed-lid service; ready")
-        check(c.shown == Look(lidClosed: false, lit: true), "open lid + ready: MacBook with light (no session needed)")
-        // Physical lid closes: shape follows immediately even if mode state is unchanged.
+        check(c.shown == Look(lidClosed: true, lit: true), "open physical lid + enabled mode: Studio with light")
+        check(c.renderedCloseFrames > 10 && c.renderedHaloFrames > 0, "toggle enable rendered full morph and halo through real status button displaylink")
+        // Physical lid only updates the menu; never suppresses the mode animation.
         c.settleAnimation()
         c.lidChanged(true)
         check(c.shown == Look(lidClosed: true, lit: true) && c.lidItem.title == "盖子：已合上", "lid close -> Studio")
         c.accept(.failure(StatusError(message: "simulated")))
-        check(c.header.title == "状态暂不可用" && !c.toggle.isEnabled && c.shown?.lit == true, "read failure reported, light kept, not hidden")
+        check(c.header.title == "状态暂不可用" && !c.toggle.isEnabled && c.shown == Look(lidClosed: true, lit: true), "read failure reported, light kept, not hidden")
         c.accept(.success(on))
         c.settleAnimation()
         // Lid opens with service lost: shape MacBook, light off, menu names the missing part.
         c.syncService(false); c.lidChanged(false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-            check(c.shown == Look(lidClosed: false, lit: false) && c.detail.title.contains("合盖服务"), "missing service shown honestly")
+            check(c.shown == Look(lidClosed: true, lit: false) && c.detail.title.contains("合盖服务"), "missing service keeps Studio and darkens light, menu reports missing service")
             c.accept(.success(on))    // refresh restarts the service
             check(c.serviceUp, "refresh restarts service")
             // External display choice: only when chosen, ready, lid closed, external present.
@@ -96,11 +101,26 @@ func runSelfTests(_ c: Controller) {
                     check(displaySleeps == 1, "no external display: nothing slept")
                     UserDefaults.standard.removeObject(forKey: c.externalKey)
                     // Opposite targets mid-animation end at the latest one.
-                    c.settleAnimation(); c.lidChanged(false); c.lidChanged(true); c.lidChanged(false)
+                    c.settleAnimation()
+                    c.accept(.success(off)); c.accept(.success(on)); c.accept(.success(off))
                     DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
-                        check(c.link == nil && c.overlay == nil && c.status.button?.image === c.image(Look(lidClosed: false, lit: true)), "latest endpoint reached, animation released")
-                        print("PASS \(assertions) assertions; mocked writes only; no pmset/Reminal/display changes")
-                        NSApp.terminate(nil)
+                        check(c.link == nil && c.overlay == nil && c.status.button?.image === c.image(Look(lidClosed: false, lit: false)), "latest endpoint reached, animation released")
+                        check(c.renderedOpenFrames > 10, "disable rendered full reverse morph through real status button displaylink")
+                        // Exercise the actual toggle selector in the other direction too (commands intercepted).
+                        c.syncService(true); c.current = on; c.shown = Look(lidClosed: true, lit: true)
+                        c.status.button?.image = c.image(c.shown!)
+                        c.toggleMode()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                            check(c.overlay?.superview === c.status.button && c.link != nil && c.maskLayer?.contents != nil && c.ticks > 1, "toggle disable has attached overlay, live displaylink and rendered mask")
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                            check(writes == 6 && c.current == off && c.shown == Look(lidClosed: false, lit: false), "toggle disable reaches normal mode with mocked writes only")
+                            check(c.overlay == nil && c.link == nil, "disable releases animation resources")
+                            c.accept(.success(ModeState(closed: true, unlocked: false, power: false)))
+                            check(c.shown == Look(lidClosed: true, lit: false) && c.detail.title.contains("未就绪"), "closed-lid setting alone selects Studio; missing readiness honestly reported")
+                            print("PASS \(assertions) assertions; rendered close=\(c.renderedCloseFrames), open=\(c.renderedOpenFrames), halo=\(c.renderedHaloFrames); real status-button animation path, mocked writes only")
+                            NSApp.terminate(nil)
+                        }
                     }
                 }
             }
