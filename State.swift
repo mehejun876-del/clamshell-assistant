@@ -7,27 +7,37 @@ struct ModeState: Equatable {
     let closed: Bool, unlocked: Bool, power: Bool
     var allOn: Bool { closed && unlocked && power }
     var configured: Bool { closed || unlocked || power }
+    func matches(_ on: Bool) -> Bool { on ? allOn : !configured }
 }
 
 // One interpretation of a successfully read settings + power snapshot.
-// Shape and light become Studio + on only when every required part is ready.
-// A partial configuration is not an enabled mode: both Enable and Disable stay available.
+// `intent` is the user's saved on/off choice; without one (first launch after an
+// upgrade) the two Reminal settings decide and nothing is written automatically.
+// There is no "partial" state: it is either on, off, or a named failure.
 struct ModePresentation {
-    enum Phase { case off, partial, ready }
     let state: ModeState
     let serviceUp: Bool
-    var phase: Phase { state.allOn && serviceUp ? .ready : (state.configured ? .partial : .off) }
-    var isReady: Bool { phase == .ready }
+    var intent: Bool? = nil
+    var note: String? = nil
+    var wantsOn: Bool { intent ?? (state.closed && state.unlocked) }
+    var isReady: Bool { wantsOn && state.allOn && serviceUp }
+    var isOff: Bool { !wantsOn && !state.configured }
+    var consistent: Bool { isReady || isOff }
     var look: Look { Look(lidClosed: isReady, lit: isReady) }
-    // One button: ready -> 关闭合盖运行; off or partial -> 开启合盖运行 (partial completes enable).
-    var toggleEnables: Bool { !isReady }
-    var toggleTitle: String { isReady ? "关闭合盖运行" : "开启合盖运行" }
+    // One button that follows the user's choice.
+    var toggleEnables: Bool { !wantsOn }
+    var toggleTitle: String { wantsOn ? "关闭合盖运行" : "开启合盖运行" }
+    var faulty: [String] {
+        let parts = [("合盖模式", state.closed), ("保持解锁", state.unlocked), ("系统禁止睡眠", state.power)]
+        if wantsOn { return parts.filter { !$0.1 }.map(\.0) + (state.allOn && !serviceUp ? ["合盖服务"] : []) }
+        return parts.filter { $0.1 }.map(\.0)
+    }
     var header: String {
-        switch phase {
-        case .ready: return "合盖运行已就绪"
-        case .partial: return "仅部分开启未就绪"
-        case .off: return "正常模式"
-        }
+        if isReady { return "合盖运行中" }
+        if isOff { return "正常模式" }
+        let text = wantsOn ? "开启失败：" + faulty.joined(separator: "、") + "未生效"
+                           : "未完全关闭：" + faulty.joined(separator: "、") + "仍开着"
+        return note.map { text + "（\($0)）" } ?? text
     }
 }
 

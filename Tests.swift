@@ -20,22 +20,25 @@ func runSelfTests(_ c: Controller) {
     }
 
     let screenshot = ModeState(closed: false, unlocked: false, power: true)
-    let screenshotUI = ModePresentation(state: screenshot, serviceUp: true)
-    check(screenshotUI.phase == .partial && screenshotUI.toggleEnables && screenshotUI.toggleTitle == "开启合盖运行" && screenshotUI.look == Look(lidClosed: false, lit: false) && screenshotUI.header == "仅部分开启未就绪", "screenshot regression: SleepDisabled alone is partial, MacBook, single enable button, never fully on")
-
     let off = ModeState(closed: false, unlocked: false, power: false)
     let on = ModeState(closed: true, unlocked: true, power: true)
-    check(ModePresentation(state: off, serviceUp: false).header == "正常模式" && ModePresentation(state: off, serviceUp: false).toggleTitle == "开启合盖运行" && ModePresentation(state: off, serviceUp: false).look == Look(lidClosed: false, lit: false), "all-off is normal mode, MacBook, button enables")
-    check(ModePresentation(state: on, serviceUp: true).header == "合盖运行已就绪" && ModePresentation(state: on, serviceUp: true).look == Look(lidClosed: true, lit: true) && ModePresentation(state: on, serviceUp: true).toggleTitle == "关闭合盖运行", "full ready is Studio+lit, button disables")
-    check(ModePresentation(state: on, serviceUp: false).phase == .partial && ModePresentation(state: on, serviceUp: false).look == Look(lidClosed: false, lit: false), "settings on but service down is partial, not Studio")
-    check(ModePresentation(state: ModeState(closed: true, unlocked: false, power: false), serviceUp: true).look == Look(lidClosed: false, lit: false), "closed-lid alone does not pretend to be fully on")
-
+    let screenshotUI = ModePresentation(state: screenshot, serviceUp: true)
+    check(!screenshotUI.consistent && screenshotUI.header == "未完全关闭：系统禁止睡眠仍开着" && screenshotUI.toggleTitle == "开启合盖运行" && screenshotUI.look == Look(lidClosed: false, lit: false), "screenshot regression: leftover SleepDisabled is a named error, never 'partial'")
+    check(ModePresentation(state: off, serviceUp: false).header == "正常模式" && ModePresentation(state: off, serviceUp: false).toggleTitle == "开启合盖运行", "all-off is normal mode")
+    check(ModePresentation(state: on, serviceUp: true).header == "合盖运行中" && ModePresentation(state: on, serviceUp: true).look == Look(lidClosed: true, lit: true) && ModePresentation(state: on, serviceUp: true).toggleTitle == "关闭合盖运行", "full on is Studio+lit, button disables")
+    check(ModePresentation(state: ModeState(closed: true, unlocked: false, power: true), serviceUp: true, intent: true).header == "开启失败：保持解锁未生效", "enable failure names the missing part")
+    check(ModePresentation(state: on, serviceUp: false, intent: true).header == "开启失败：合盖服务未生效", "service down is named")
+    check(ModePresentation(state: ModeState(closed: false, unlocked: false, power: true), serviceUp: false, intent: true, note: "需要管理员授权，请点开关重试").header == "开启失败：合盖模式、保持解锁未生效（需要管理员授权，请点开关重试）", "failure note is appended")
     for bits in 0..<8 {
         for service in [false, true] {
-            let state = ModeState(closed: bits & 1 != 0, unlocked: bits & 2 != 0, power: bits & 4 != 0)
-            let ui = ModePresentation(state: state, serviceUp: service)
-            let ready = bits == 7 && service
-            check(ui.isReady == ready && ui.look == Look(lidClosed: ready, lit: ready) && ui.toggleEnables == !ready && ui.toggleTitle == (ready ? "关闭合盖运行" : "开启合盖运行"), "one snapshot drives shape, light, status and the single toggle")
+            for want in [nil, false, true] as [Bool?] {
+                let state = ModeState(closed: bits & 1 != 0, unlocked: bits & 2 != 0, power: bits & 4 != 0)
+                let ui = ModePresentation(state: state, serviceUp: service, intent: want)
+                let wants = want ?? (state.closed && state.unlocked)
+                let ready = wants && bits == 7 && service
+                check(!ui.header.contains("部分") && ui.look == Look(lidClosed: ready, lit: ready) && ui.toggleTitle == (wants ? "关闭合盖运行" : "开启合盖运行"), "every state is on, off or a named failure; one button follows the choice")
+                check(ui.consistent || ui.header.hasPrefix("开启失败：") || ui.header.hasPrefix("未完全关闭："), "inconsistent states always name what failed")
+            }
         }
     }
 
@@ -63,14 +66,16 @@ func runSelfTests(_ c: Controller) {
         }
     }
 
-    var enabled = false, writes = 0, commands = 0
+    c.defaults.removePersistentDomain(forName: "local.reminal.clamshellassistant.selftest")
+    var closedOn = false, unlockedOn = false, powerOn = true, writes = 0, commands = 0, sudoOK = true, revertPower = false
     c.testCommand = { path, args in
         commands += 1
-        if path == "/usr/bin/sudo" { writes += 1; return (0, "") }
+        if path == "/usr/bin/sudo" { writes += 1; if sudoOK && !revertPower { powerOn = args.last == "1" }; return sudoOK ? (0, "") : (1, "sudo: a password is required") }
+        if path == "/usr/bin/osascript" { print("FAIL automatic restore must never prompt"); exit(1) }
         if args == ["displaysleepnow"] { print("FAIL displaysleepnow must not be issued"); exit(1) }
-        if args.count == 3 && args[0] == "settings" { writes += 1; enabled = args[2] == "on"; return (0, "") }
-        if args == ["settings"] { return (0, "closed-lid \(enabled ? "on" : "off")\nalways-unlocked \(enabled ? "on" : "off")\n") }
-        if args == ["-g", "live"] { return (0, "SleepDisabled \(enabled ? "1" : "0")\n") }
+        if args.count == 3 && args[0] == "settings" { writes += 1; if args[1] == "closed-lid" { closedOn = args[2] == "on" } else { unlockedOn = args[2] == "on" }; return (0, "") }
+        if args == ["settings"] { return (0, "closed-lid \(closedOn ? "on" : "off")\nalways-unlocked \(unlockedOn ? "on" : "off")\n") }
+        if args == ["-g", "live"] { return (0, "SleepDisabled \(powerOn ? "1" : "0")\n") }
         print("FAIL unexpected command: \(path) \(args)"); exit(1)
     }
     UserDefaults.standard.set("sleep", forKey: "ExternalDisplayWhenLidClosed")
@@ -78,11 +83,18 @@ func runSelfTests(_ c: Controller) {
     c.updateMenu()
     check(UserDefaults.standard.object(forKey: "ExternalDisplayWhenLidClosed") == nil || visibleTitles() == visibleTitles(), "legacy external preference is not consulted")
     UserDefaults.standard.removeObject(forKey: "ExternalDisplayWhenLidClosed")
-    check(visibleTitles() == ["仅部分开启未就绪", "开启合盖运行", "刷新状态", "退出助手"], "partial menu has only the allowed items")
+    check(c.intent == nil && writes == 0, "first launch without a saved choice writes nothing")
+    c.accept(.success(screenshot))
+    check(writes == 0 && !c.busy, "no saved choice: mixed state is reported, not changed automatically")
+    check(visibleTitles() == ["未完全关闭：系统禁止睡眠仍开着", "开启合盖运行", "刷新状态", "退出助手"], "mixed state menu has only the allowed items and names the part")
     check(!hasForbiddenCopy(), "no leftover lid/external/English setting copy")
-    check(c.toggle.isEnabled && c.toggle.title == "开启合盖运行" && c.header.title == "仅部分开启未就绪" && c.shown == Look(lidClosed: false, lit: false), "partial keeps MacBook and uses the single enable button")
+    check(c.toggle.isEnabled && c.shown == Look(lidClosed: false, lit: false), "mixed state keeps MacBook and the single button")
+    c.refreshMenu()
+    check(c.intent == false, "explicit refresh adopts the shown choice (off)")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+    check(!powerOn && writes == 1 && c.current == off && c.header.title == "正常模式", "refresh restores off: only the leftover sleep switch is rewritten")
 
-    c.current = off; c.serviceUp = false; c.shown = Look(lidClosed: false, lit: false); c.updateMenu()
+    c.current = off; c.serviceUp = false; c.shown = Look(lidClosed: false, lit: false); c.updateMenu(); writes = 0
     check(visibleTitles() == ["正常模式", "开启合盖运行", "刷新状态", "退出助手"] && c.toggle.title == "开启合盖运行" && c.toggle.isEnabled, "off menu is a single enable button")
 
     c.refresh()
@@ -97,7 +109,7 @@ func runSelfTests(_ c: Controller) {
         check(writes == 3, "rapid clicks cause exactly one mode operation (mocked)")
         check(commands < 20, "refresh requests coalesced")
         check(c.current == on && c.serviceUp && c.ready && c.shown == Look(lidClosed: true, lit: true), "full enable is Studio + lit")
-        check(c.header.title == "合盖运行已就绪" && c.toggle.title == "关闭合盖运行" && c.toggle.isEnabled, "ready menu is a single disable button")
+        check(c.header.title == "合盖运行中" && c.toggle.title == "关闭合盖运行" && c.toggle.isEnabled && c.intent == true, "on menu is a single disable button; choice saved")
         check(c.renderedCloseFrames > 10 && c.renderedHaloFrames > 0, "enable rendered full morph and halo through real status button displaylink")
         c.settleAnimation()
         c.accept(.failure(StatusError(message: "simulated")))
@@ -107,14 +119,32 @@ func runSelfTests(_ c: Controller) {
         c.syncService(false)
         c.updateMenu()
         c.settleAnimation()
-        check(c.shown == Look(lidClosed: false, lit: false) && c.header.title == "仅部分开启未就绪", "missing service is partial and does not stay Studio")
+        check(c.shown == Look(lidClosed: false, lit: false) && c.header.title == "开启失败：合盖服务未生效", "missing service is a named failure and does not stay Studio")
         c.accept(.success(on))
         c.settleAnimation()
         check(c.serviceUp && c.shown == Look(lidClosed: true, lit: true), "refresh restarts service and returns to ready Studio")
-        c.accept(.success(off)); c.accept(.success(on)); c.accept(.success(off))
+        // Something else (e.g. UU远程) turns the sleep switch off behind our back: restored without prompting.
+        writes = 0; powerOn = false
+        c.accept(.success(ModeState(closed: true, unlocked: true, power: false)))
+        check(c.busy, "external change starts an automatic restore")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+        check(powerOn && writes == 1 && c.current == on && c.header.title == "合盖运行中", "automatic restore rewrites only the changed part")
+        // A program that keeps reverting it: bounded retries, then a named error.
+        revertPower = true; powerOn = false; writes = 0
+        c.accept(.success(ModeState(closed: true, unlocked: true, power: false)))
+        DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
+        check(writes <= 3 && c.header.title.hasPrefix("开启失败：系统禁止睡眠未生效"), "fighting program gets at most 3 restores, then a named error: \(c.header.title) writes=\(writes)")
+        revertPower = false; c.refreshMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+        check(powerOn && c.header.title == "合盖运行中", "refresh retries and recovers")
+        c.settleAnimation()
+        c.intent = false
+        closedOn = false; unlockedOn = false; powerOn = false
+        c.accept(.success(off))
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) {
             check(c.link == nil && c.overlay == nil && c.status.button?.image === c.image(Look(lidClosed: false, lit: false)), "latest endpoint reached, animation released")
             check(c.renderedOpenFrames > 10, "disable rendered full reverse morph through real status button displaylink")
+            closedOn = true; unlockedOn = true; powerOn = true; c.intent = true; writes = 0
             c.syncService(true); c.current = on; c.shown = Look(lidClosed: true, lit: true)
             c.status.button?.image = c.image(c.shown!)
             c.toggleMode()
@@ -122,16 +152,26 @@ func runSelfTests(_ c: Controller) {
                 check(c.overlay?.superview === c.status.button && c.link != nil && c.maskLayer?.contents != nil && c.ticks > 1, "disable has attached overlay, live displaylink and rendered mask")
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
-                check(writes == 6 && c.current == off && c.shown == Look(lidClosed: false, lit: false) && c.header.title == "正常模式", "disable reaches normal mode with mocked writes only")
+                check(writes == 3 && c.current == off && c.shown == Look(lidClosed: false, lit: false) && c.header.title == "正常模式", "disable reaches normal mode with mocked writes only")
                 check(c.overlay == nil && c.link == nil, "disable releases animation resources")
-                c.accept(.success(ModeState(closed: true, unlocked: false, power: false)))
-                c.settleAnimation()
-                check(c.shown == Look(lidClosed: false, lit: false) && c.header.title == "仅部分开启未就绪" && c.toggle.title == "开启合盖运行", "closed-lid alone stays MacBook, button completes enable")
-                    check(visibleTitles() == ["仅部分开启未就绪", "开启合盖运行", "刷新状态", "退出助手"], "partial still has a single button")
+                check(c.intent == false, "disable saved the off choice")
+                // Authorization missing during an automatic restore: no prompt, named error, no retry loop.
+                sudoOK = false; powerOn = true; writes = 0
+                c.accept(.success(screenshot))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                    c.settleAnimation()
+                    check(writes == 1 && c.header.title == "未完全关闭：系统禁止睡眠仍开着（需要管理员授权，请点开关重试）" && c.toggle.title == "开启合盖运行", "unauthorized restore is named and not retried: \(c.header.title) writes=\(writes)")
+                    check(visibleTitles().count == 4 && !visibleTitles().contains { $0.contains("部分") }, "menu never shows a partial state")
+                    c.defaults.removePersistentDomain(forName: "local.reminal.clamshellassistant.selftest")
                     print("PASS \(assertions) assertions; rendered close=\(c.renderedCloseFrames), open=\(c.renderedOpenFrames), halo=\(c.renderedHaloFrames); real status-button animation path, mocked writes only")
                     NSApp.terminate(nil)
+                }
             }
         }
+        }
+        }
+        }
+    }
     }
 }
 #endif

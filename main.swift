@@ -269,6 +269,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var lastError: String?
     var current: ModeState?
     var settingsWatch: DispatchSourceFileSystemObject?
+    var powerWatch: DispatchSourceFileSystemObject?
+    // The user's last on/off choice, restored whenever something else changes a part.
+    #if SELFTEST
+    let defaults = UserDefaults(suiteName: "local.reminal.clamshellassistant.selftest")!
+    #else
+    let defaults = UserDefaults.standard
+    #endif
+    let intentKey = "ModeIntent"
+    var intent: Bool? {
+        get { defaults.object(forKey: intentKey) as? Bool }
+        set { if let v = newValue { defaults.set(v, forKey: intentKey) } else { defaults.removeObject(forKey: intentKey) } }
+    }
+    var note: String?                    // why the last restore failed, shown next to the named parts
+    var autoFixes: [Date] = []           // automatic restores in the last two minutes
     var refreshWork: DispatchWorkItem?
     var observers: [NSObjectProtocol] = []
     var shown: Look?
@@ -322,7 +336,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         #endif
     }
     func applicationWillTerminate(_ notification: Notification) {
-        stopPlayback(); settingsWatch?.cancel(); syncService(false)
+        stopPlayback(); settingsWatch?.cancel(); powerWatch?.cancel(); syncService(false)
     }
     #if BENCH
     func benchmark(remaining: Int, target: Bool) {
@@ -353,7 +367,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return runCommand(path, args, timeout: path == "/usr/bin/osascript" ? 120 : 20)
         #endif
     }
-    var presentation: ModePresentation? { current.map { ModePresentation(state: $0, serviceUp: serviceUp) } }
+    var presentation: ModePresentation? { current.map { ModePresentation(state: $0, serviceUp: serviceUp, intent: intent, note: note) } }
     var ready: Bool { lastError == nil && presentation?.isReady == true }
     func syncService(_ want: Bool) {
         #if SELFTEST
@@ -398,6 +412,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self?.settleAnimation(); self?.scheduleRefresh()
         })
         watchSettings()
+        watchPower()
+    }
+    // `pmset -a disablesleep` (ours or another program's) rewrites this file.
+    func watchPower() {
+        powerWatch?.cancel(); powerWatch = nil
+        let fd = open("/Library/Preferences/com.apple.PowerManagement.plist", O_EVTONLY)
+        guard fd >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd,
+            eventMask: [.write, .extend, .attrib, .rename, .delete], queue: .main)
+        source.setCancelHandler { close(fd) }
+        source.setEventHandler { [weak self, weak source] in
+            guard let self = self else { return }
+            if let data = source?.data, !data.isDisjoint(with: [.rename, .delete]) {
+                // Atomic replace: re-arm on the new file.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.watchPower() }
+            }
+            self.scheduleRefresh()
+        }
+        powerWatch = source; source.resume()
     }
     func watchSettings() {
         settingsWatch?.cancel(); settingsWatch = nil
@@ -504,7 +537,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     func accept(_ result: Result<ModeState, Error>) {
         switch result {
-        case .success(let value): current = value; lastError = nil; syncService(value.closed || value.unlocked)
+        case .success(let value):
+            current = value; lastError = nil; syncService(value.closed || value.unlocked)
+            if value.matches(intent ?? (value.closed && value.unlocked)) { note = nil }
+            reconcileIfNeeded()
         case .failure(let error): lastError = error.localizedDescription
         }
         updateMenu()
@@ -550,46 +586,79 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         status.button?.toolTip = "合盖助手：" + snapshot.header
     }
     func menuWillOpen(_ menu: NSMenu) { refresh() }
-    @objc func refreshMenu() { pingPending = !busy && !checking; refresh() }
+    @objc func refreshMenu() {
+        // An explicit refresh adopts the shown choice (if none was saved yet) and retries a failed restore.
+        if intent == nil, let shownChoice = presentation?.wantsOn { intent = shownChoice }
+        autoFixes = []; note = nil
+        pingPending = !busy && !checking; refresh()
+    }
+    // Bring every part back to the saved choice. Never prompts; at most 3 tries per 2 minutes.
+    func reconcileIfNeeded() {
+        guard let want = intent, let state = current, !state.matches(want), !busy, lastError == nil else { return }
+        let now = Date()
+        autoFixes = autoFixes.filter { now.timeIntervalSince($0) < 120 }
+        guard autoFixes.count < 3 else { if note == nil { note = "被其他程序反复改回" }; return }
+        autoFixes.append(now)
+        setMode(want, interactive: false)
+    }
     @objc func quitApp() { NSApp.terminate(nil) }
     @objc func toggleMode() {
-        guard let snapshot = presentation else { return }
-        setMode(snapshot.toggleEnables)
+        guard !busy, let snapshot = presentation, lastError == nil else { return }
+        let previous = intent
+        intent = snapshot.toggleEnables; autoFixes = []; note = nil
+        setMode(snapshot.toggleEnables, previous: previous)
     }
-    func setMode(_ enable: Bool) {
-        guard !busy, current != nil, lastError == nil else { return }
+    func setMode(_ enable: Bool, interactive: Bool = true, previous: Bool? = nil) {
+        guard !busy, let before = current, lastError == nil else { return }
         generation += 1
         busy = true; updateMenu()
         worker.async {
-            let value = enable ? "1" : "0"
-            // The first authorization installs a rule limited to these two pmset commands.
-            var auth = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value])
-            if auth.0 != 0 {
-                let uid = getuid()
-                let path = "/private/etc/sudoers.d/reminal-clamshell-\(uid)"
-                let user = NSUserName()
-                let command = "umask 077; t=\(path).tmp; printf '%s\\n' '\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1' > \"$t\" && chmod 0440 \"$t\" && /usr/sbin/visudo -cf \"$t\" >/dev/null && mv -f \"$t\" \(path)"
-                let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-                let script = "do shell script \"\(escaped)\" with administrator privileges with prompt \"合盖助手需要一次管理员授权，以后切换时无需重复输入密码。\""
-                auth = self.run("/usr/bin/osascript", ["-e", script])
-                if auth.0 == 0 { auth = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value]) }
-            }
-            var error: String? = nil
-            if auth.0 == 0 {
-                let mode = enable ? "on" : "off"
-                let closedResult = self.run(self.reminal, ["settings", "closed-lid", mode])
-                let unlockResult = self.run(self.reminal, ["settings", "always-unlocked", mode])
-                if closedResult.0 != 0 || unlockResult.0 != 0 { error = "Reminal 设置未能保存，请刷新状态后重试。" }
-                switch self.state() {
-                case .success(let actual):
-                    if enable && !actual.allOn { error = "部分设置未生效，请刷新状态后重试。" }
-                    if !enable && actual.configured { error = "部分设置未能关闭，请刷新状态后重试。" }
-                case .failure(let failure): error = failure.localizedDescription
+            var note: String? = nil, canceled = false, detail = ""
+            if before.power != enable {
+                let value = enable ? "1" : "0"
+                var auth = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value])
+                if auth.0 != 0 && interactive {
+                    // The first authorization installs a rule limited to these two pmset commands.
+                    let uid = getuid()
+                    let path = "/private/etc/sudoers.d/reminal-clamshell-\(uid)"
+                    let user = NSUserName()
+                    let command = "umask 077; t=\(path).tmp; printf '%s\\n' '\(user) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1' > \"$t\" && chmod 0440 \"$t\" && /usr/sbin/visudo -cf \"$t\" >/dev/null && mv -f \"$t\" \(path)"
+                    let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+                    let script = "do shell script \"\(escaped)\" with administrator privileges with prompt \"合盖助手需要一次管理员授权，以后切换时无需重复输入密码。\""
+                    auth = self.run("/usr/bin/osascript", ["-e", script])
+                    canceled = auth.1.contains("User canceled") || auth.1.contains("用户取消")
+                    if auth.0 == 0 { auth = self.run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value]) }
                 }
-            } else if !auth.1.contains("User canceled") && !auth.1.contains("用户取消") { error = "无法更改系统睡眠设置：\n" + auth.1 }
+                if auth.0 != 0 { note = interactive ? "无法更改系统睡眠设置" : "需要管理员授权，请点开关重试"; detail = auth.1 }
+            }
+            if !canceled {
+                // Only rewrite what differs, so a restore never touches parts that are already right.
+                let mode = enable ? "on" : "off"
+                if before.closed != enable, self.run(self.reminal, ["settings", "closed-lid", mode]).0 != 0 { note = note ?? "Reminal 设置未能保存" }
+                if before.unlocked != enable, self.run(self.reminal, ["settings", "always-unlocked", mode]).0 != 0 { note = note ?? "Reminal 设置未能保存" }
+            }
+            // powerd applies pmset asynchronously: re-read briefly before calling it a failure.
+            var result = self.state()
+            for _ in 0..<8 {
+                if canceled { break }
+                if case .success(let actual) = result, actual.matches(enable) { break }
+                Thread.sleep(forTimeInterval: 0.25); result = self.state()
+            }
             DispatchQueue.main.async {
-                self.busy = false; self.updateMenu(); self.refresh()
-                if let error = error { let a = NSAlert(); a.messageText = "切换未完成"; a.informativeText = error; a.runModal() }
+                self.busy = false
+                if canceled { self.intent = previous }
+                var failed = false
+                if case .success(let actual) = result { failed = !canceled && !actual.matches(enable) } else { failed = true }
+                self.note = failed ? note : nil
+                // A failure that needs the user (authorization, a broken install) is not retried automatically.
+                if failed && note != nil { self.autoFixes = Array(repeating: Date(), count: 3) }
+                self.accept(result)
+                if self.refreshPending { self.refresh() }
+                if failed && interactive && !canceled {
+                    let a = NSAlert(); a.messageText = "切换未完成"
+                    a.informativeText = (self.presentation?.header ?? self.lastError ?? "状态读取失败") + (detail.isEmpty ? "" : "\n" + detail)
+                    a.runModal()
+                }
             }
         }
     }
