@@ -3,16 +3,33 @@ import AppKit
 
 func runSelfTests(_ c: Controller) {
     var assertions = 0
+    // The self-test suite is per-process (see Controller.selftestSuite), so a crashed or killed
+    // run can never leak into the next one. Still remove it on any exit — including a failed
+    // assertion — so no orphaned preference files accumulate. atexit covers every exit path;
+    // the per-PID name means a non-capturing @convention(c) closure is enough.
+    _ = atexit { UserDefaults(suiteName: Controller.selftestSuite)?.removePersistentDomain(forName: Controller.selftestSuite) }
     func check(_ value: @autoclosure () -> Bool, _ message: String) {
         assertions += 1
         guard value() else { print("FAIL: " + message); exit(1) }
     }
+    // The 1.4.1 menu items. V2 adds only the「高级选项」submenu item (and one separator),
+    // which is checked separately below, so every original assertion keeps its exact list.
     func visibleTitles() -> [String] {
-        c.menu.items.filter { !$0.isSeparatorItem && !$0.isHidden }.map(\.title)
+        c.menu.items.filter { !$0.isSeparatorItem && !$0.isHidden && $0 !== c.advancedItem }.map(\.title)
     }
     func hasForbiddenCopy() -> Bool {
         c.menu.items.contains { $0.title.contains("外接") || $0.title.contains("盖子") || $0.title.contains("closed-lid") || $0.title.contains("always-unlocked") || $0.title.contains("完成开启") }
     }
+
+    // V2: never touch the user's real support directory, lease, agent configs, power or login items.
+    let scratch = NSTemporaryDirectory() + "clamshell-selftest-support-\(getpid())"
+    try? FileManager.default.createDirectory(atPath: scratch, withIntermediateDirectories: true)
+    AppPaths.overrideDir = scratch
+    c.hookHome = scratch + "/home"
+    c.leaseStore.remove()
+    c.defaults.removePersistentDomain(forName: Controller.selftestSuite)
+    runPolicyTests { check($0, $1) }
+    print("PASS V2 policy: \(assertions) assertions so far (mocked inputs only)")
 
     if ProcessInfo.processInfo.environment["VERIFY_LIVE"] == "1" {
         let live = try! readState(reminal: ProcessInfo.processInfo.environment["LIVE_REMINAL"] ?? c.reminal) { runCommand($0, $1) }
@@ -66,10 +83,11 @@ func runSelfTests(_ c: Controller) {
         }
     }
 
-    c.defaults.removePersistentDomain(forName: "local.reminal.clamshellassistant.selftest")
-    var closedOn = false, unlockedOn = false, powerOn = true, writes = 0, commands = 0, sudoOK = true, revertPower = false
+    c.defaults.removePersistentDomain(forName: Controller.selftestSuite)
+    var closedOn = false, unlockedOn = false, powerOn = true, writes = 0, commands = 0, sudoOK = true, revertPower = false, sleeps = 0
     c.testCommand = { path, args in
         commands += 1
+        if path == "/usr/bin/pmset" && args == ["sleepnow"] { sleeps += 1; return (0, "") }
         if path == "/usr/bin/sudo" { writes += 1; if sudoOK && !revertPower { powerOn = args.last == "1" }; return sudoOK ? (0, "") : (1, "sudo: a password is required") }
         if path == "/usr/bin/osascript" { print("FAIL automatic restore must never prompt"); exit(1) }
         if args == ["displaysleepnow"] { print("FAIL displaysleepnow must not be issued"); exit(1) }
@@ -86,7 +104,7 @@ func runSelfTests(_ c: Controller) {
     check(c.intent == nil && writes == 0, "first launch without a saved choice writes nothing")
     c.accept(.success(screenshot))
     check(writes == 0 && !c.busy, "no saved choice: mixed state is reported, not changed automatically")
-    check(visibleTitles() == ["未完全关闭：系统禁止睡眠仍开着", "开启合盖运行", "刷新状态", "退出助手"], "mixed state menu has only the allowed items and names the part")
+    check(visibleTitles() == [c.fitted("未完全关闭：系统禁止睡眠仍开着", c.mainTextBudget), "开启合盖运行", "刷新状态", "退出助手"] && c.header.toolTip == "未完全关闭：系统禁止睡眠仍开着", "mixed state menu has only the allowed items and names the part")
     check(!hasForbiddenCopy(), "no leftover lid/external/English setting copy")
     check(c.toggle.isEnabled && c.shown == Look(lidClosed: false, lit: false), "mixed state keeps MacBook and the single button")
     c.refreshMenu()
@@ -119,7 +137,7 @@ func runSelfTests(_ c: Controller) {
         c.syncService(false)
         c.updateMenu()
         c.settleAnimation()
-        check(c.shown == Look(lidClosed: false, lit: false) && c.header.title == "开启失败：合盖服务未生效", "missing service is a named failure and does not stay Studio")
+        check(c.shown == Look(lidClosed: false, lit: false) && c.header.title == c.fitted("开启失败：合盖服务未生效", c.mainTextBudget) && c.header.toolTip == "开启失败：合盖服务未生效", "missing service is a named failure and does not stay Studio")
         c.accept(.success(on))
         c.settleAnimation()
         check(c.serviceUp && c.shown == Look(lidClosed: true, lit: true), "refresh restarts service and returns to ready Studio")
@@ -133,7 +151,7 @@ func runSelfTests(_ c: Controller) {
         revertPower = true; powerOn = false; writes = 0
         c.accept(.success(ModeState(closed: true, unlocked: true, power: false)))
         DispatchQueue.main.asyncAfter(deadline: .now() + 9) {
-        check(writes <= 3 && c.header.title.hasPrefix("开启失败：系统禁止睡眠未生效"), "fighting program gets at most 3 restores, then a named error: \(c.header.title) writes=\(writes)")
+        check(writes <= 3 && (c.header.toolTip ?? "").hasPrefix("开启失败：系统禁止睡眠未生效") && c.header.title == c.fitted(c.header.toolTip ?? "", c.mainTextBudget), "fighting program gets at most 3 restores, then a named error: \(c.header.title) writes=\(writes)")
         revertPower = false; c.refreshMenu()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
         check(powerOn && c.header.title == "合盖运行中", "refresh retries and recovers")
@@ -160,11 +178,271 @@ func runSelfTests(_ c: Controller) {
                 c.accept(.success(screenshot))
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                     c.settleAnimation()
-                    check(writes == 1 && c.header.title == "未完全关闭：系统禁止睡眠仍开着（需要管理员授权，请点开关重试）" && c.toggle.title == "开启合盖运行", "unauthorized restore is named and not retried: \(c.header.title) writes=\(writes)")
+                    check(writes == 1 && c.header.toolTip == "未完全关闭：系统禁止睡眠仍开着（需要管理员授权，请点开关重试）" && c.header.title == c.fitted("未完全关闭：系统禁止睡眠仍开着（需要管理员授权，请点开关重试）", c.mainTextBudget) && c.textWidth(c.header.title) <= c.mainTextBudget && c.toggle.title == "开启合盖运行", "unauthorized restore is named and not retried: \(c.header.title) writes=\(writes)")
                     check(visibleTitles().count == 4 && !visibleTitles().contains { $0.contains("部分") }, "menu never shows a partial state")
-                    c.defaults.removePersistentDomain(forName: "local.reminal.clamshellassistant.selftest")
-                    print("PASS \(assertions) assertions; rendered close=\(c.renderedCloseFrames), open=\(c.renderedOpenFrames), halo=\(c.renderedHaloFrames); real status-button animation path, mocked writes only")
-                    NSApp.terminate(nil)
+
+                    // ---- V2.1 controller scenarios: mocked commands, injected battery/thermal/lid/idle/agents/clock ----
+                    var fake = Date(timeIntervalSince1970: 1_900_000_000)
+                    c.clock = { fake }
+                    func advance(_ s: Double) { fake = fake.addingTimeInterval(s) }
+                    func ev(_ k: AgentKind, _ s: String, _ p: AgentPhase, _ t: Double) -> AgentEvent { AgentEvent(kind: k, session: hashSession(s), phase: p, sentAt: t) }
+                    func seq(_ steps: [(Double, () -> Void)], _ done: @escaping () -> Void) {
+                        guard let first = steps.first else { done(); return }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + first.0) { first.1(); seq(Array(steps.dropFirst()), done) }
+                    }
+                    func advTitles() -> [String] { c.menuNeedsUpdate(c.advancedMenu); return c.advancedMenu.items.map { $0.isSeparatorItem ? "—" : $0.title } }
+                    let fm = FileManager.default
+                    let home = c.hookHome
+                    func target(_ k: AgentKind) -> HookTarget { HookTarget.all(home: home).first { $0.kind == k }! }
+                    func backupCount() -> Int { ((try? fm.contentsOfDirectory(atPath: home + "/.codex")) ?? []).filter { $0.contains("clamshell-backup") }.count }
+                    let wait = 1.5
+                    // 固定菜单宽度：启动时定一次，下面任何状态都不改变它；每行文字都不超过固定宽度。
+                    let fixedMain = c.menu.minimumWidth, fixedAdv = c.advancedMenu.minimumWidth
+                    func widthsFixed() -> Bool {
+                        _ = advTitles()
+                        let mainFits = c.menu.items.allSatisfy { $0.isSeparatorItem || c.textWidth($0.title) <= c.mainTextBudget }
+                        let advFits = c.advancedMenu.items.allSatisfy { $0.isSeparatorItem || c.textWidth($0.title) <= c.advancedTextBudget }
+                        return fixedMain > 0 && fixedAdv > 0 && c.menu.minimumWidth == fixedMain && c.advancedMenu.minimumWidth == fixedAdv
+                            && abs(c.menu.size.width - fixedMain) < 0.5 && abs(c.advancedMenu.size.width - fixedAdv) < 0.5 && mainFits && advFits
+                    }
+                    let v2Steps: [(Double, () -> Void)] = [
+                    (0.1, {
+                        c.settleAnimation()
+                        sudoOK = true; revertPower = false; closedOn = false; unlockedOn = false; powerOn = false
+                        c.intent = false; c.smartMode = false; c.autoStopHours = 0; c.autoStopAt = nil; c.suppressed = false
+                        c.autoFixes = []; c.note = nil; c.leaseStore.remove(); c.current = off; c.syncService(false)
+                        c.batteryReader = { BatteryReading(present: true, percent: 80, onAC: true) }
+                        c.thermalReader = { .nominal }
+                        c.lidReader = { false }; c.idleReader = { 0 }
+                        c.accept(.success(off)); c.settleAnimation(); writes = 0
+                        let titles = c.menu.items.map { $0.isSeparatorItem ? "—" : $0.title }
+                        check(titles == ["正常模式", "—", "开启合盖运行", "刷新状态", "—", "高级选项", "—", "退出助手"],
+                              "V2 main menu keeps the 1.4.1 order and wording, plus one separator and one submenu above 退出助手: \(titles)")
+                        var original = titles; original.remove(at: 6); original.remove(at: 5)
+                        check(original == ["正常模式", "—", "开启合盖运行", "刷新状态", "—", "退出助手"], "without the two V2 entries the menu is exactly 1.4.1's")
+                        check(c.advancedItem.submenu === c.advancedMenu && c.advancedItem.isEnabled && c.advancedItem.view == nil, "advanced entry is a native submenu")
+                        let adv = advTitles()
+                        let expectedAdv = ["电池 80% · 散热正常", "—", "AI 智能模式", "—", "定时停止", "开机启动"]
+                        check(adv == expectedAdv || (adv.last == "移除免密授权…" && Array(adv.dropLast()) == expectedAdv),
+                              "submenu: read-only status, AI smart mode, timed stop, login item (and the rule removal only when it exists): \(adv)")
+                        let items = c.advancedMenu.items
+                        check(items.first { $0.title == "AI 智能模式" }?.state == .off && !c.smartMode, "AI smart mode is off by default")
+                        check(!adv.contains { $0.contains("Hook") } && !adv.contains("确认恢复合盖运行"), "no Agent Hook entry and no resume entry: hooks are invisible, there is no safety pause")
+                        check(items.first?.isEnabled == false, "the battery/thermal line is read-only")
+                        let stops = items.first { $0.title == "定时停止" }?.submenu?.items ?? []
+                        check(stops.map(\.title) == ["关闭", "1 小时", "2 小时", "4 小时", "8 小时"] && stops.first?.state == .on, "timed stop: fixed choices, off by default")
+                        check(items.allSatisfy { $0.view == nil } && !items.contains { $0.title.unicodeScalars.contains { $0.properties.isEmojiPresentation } }, "native items only: no custom views, no emoji")
+                        check(c.policyTimer == nil && c.link == nil, "idle: no timer and no display link")
+                        check(fixedMain > 100 && fixedAdv > 100 && widthsFixed(), "fixed menu widths from launch (normal mode)")
+                        check(c.advancedMenu.items.allSatisfy { $0.isSeparatorItem || $0.title.count <= 20 }, "submenu lines are short: \(advTitles())")
+                        // 和以前一样窄：主菜单不比 1.4.1 的原始菜单（同样的短文字 + ⌘Q）宽，子菜单由电池/热压力那一行决定。
+                        let legacy = NSMenu(); legacy.autoenablesItems = false
+                        for t in ["AI 智能模式待命", "-", "开启合盖运行", "刷新状态", "-", "退出助手"] {
+                            legacy.addItem(t == "-" ? .separator() : NSMenuItem(title: t, action: nil, keyEquivalent: t == "退出助手" ? "q" : ""))
+                        }
+                        let legacyAdv = NSMenu()
+                        legacyAdv.addItem(NSMenuItem(title: "电池 100%（已接电源） · 热压力：正常", action: nil, keyEquivalent: ""))
+                        let legacyStops = NSMenuItem(title: "定时自动停止", action: nil, keyEquivalent: ""); legacyStops.submenu = NSMenu(); legacyAdv.addItem(legacyStops)
+                        check(fixedMain <= ceil(legacy.size.width) + 24, "main menu is as narrow as before: \(fixedMain) vs \(legacy.size.width)")
+                        check(fixedAdv <= ceil(legacyAdv.size.width) + 24, "submenu is as narrow as before: \(fixedAdv) vs \(legacyAdv.size.width)")
+                        let longText = String(repeating: "很长的状态文字", count: 10)
+                        check(c.fitted(longText, c.mainTextBudget).hasSuffix("…") && c.textWidth(c.fitted(longText, c.mainTextBudget)) <= c.mainTextBudget, "over-long text is cut with … and never widens the menu")
+                        check(c.status.length == statusBarLength && statusBarLength == 35 && W == 27 && H == 18, "status item uses the animation pack size (35pt, 27x18 canvas)")
+                        // Battery and thermal pressure never matter: 5 % on battery and critical pressure.
+                        c.batteryReader = { BatteryReading(present: true, percent: 5, onAC: false) }
+                        c.thermalReader = { .critical }
+                        check(advTitles().first == "电池 5% · 散热危急", "status line shows battery and thermal pressure, never degrees")
+                        c.toggleMode()
+                        check(c.busy, "manual enable at 5 % on battery with critical pressure is not refused")
+                    }),
+                    (wait, {
+                        check(c.current == on && c.header.title == "合盖运行中" && c.leaseStore.exists && c.guardRunning, "enable: lease written before sleep is disabled, crash guard running")
+                        check(c.policyTimer == nil, "classic mode on: no timer")
+                        check(widthsFixed(), "fixed menu widths (manual on)")
+                        c.settleAnimation(); writes = 0
+                        _ = advTitles(); c.policyChanged(); c.accept(.success(on))
+                        check(writes == 0 && !c.busy && c.current == on && c.header.title == "合盖运行中", "battery and thermal readings never pause or change the running mode")
+                        c.toggleMode()
+                    }),
+                    (wait, {
+                        check(c.current == off && c.intent == false, "manual off")
+                        c.settleAnimation(); writes = 0
+                        c.batteryReader = { BatteryReading(present: true, percent: 80, onAC: true) }; c.thermalReader = { .nominal }
+                        // Agents present in the (temporary) home: Codex with a hook of the user's own, Gemini; no Grok.
+                        try? fm.createDirectory(atPath: home + "/.codex", withIntermediateDirectories: true)
+                        try? fm.createDirectory(atPath: home + "/.gemini", withIntermediateDirectories: true)
+                        _ = fm.createFile(atPath: home + "/.codex/hooks.json", contents: Data("{\"hooks\":{\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"/usr/local/bin/my-notify\"}]}]}}".utf8))
+                        c.helperPath = home + "/clamshell-helper"
+                        _ = fm.createFile(atPath: c.helperPath, contents: Data("#!/bin/sh\nexit 0\n".utf8), attributes: [.posixPermissions: 0o755])
+                        c.sudoRuleInstalled = false
+                        c.toggleSmart()
+                        check(!c.smartMode && target(.codex).status() == .notInstalled, "without the one-time authorization AI smart mode stays off and touches nothing")
+                        c.sudoRuleInstalled = true
+                        c.toggleSmart()
+                        check(c.smartMode && writes == 0 && !c.busy && c.policyTimer == nil, "AI smart mode on, no task: nothing changes, no timer")
+                        check(target(.codex).status() == .installed && target(.codex).isCurrent(helper: c.helperPath) && target(.gemini).status() == .installed,
+                              "turning AI smart mode on installs the hooks of every detected agent by itself")
+                        check(target(.grok).status() == .agentMissing && target(.antigravity).status() == .agentMissing, "agents that are not installed are left alone")
+                        check(c.defaults.bool(forKey: "CodexTrustNotice"), "the one-time Codex trust notice is sent")
+                        let backups = backupCount()
+                        c.ensureHooks()
+                        check(backupCount() == backups, "hooks already pointing at this helper are not rewritten")
+                        let mineKept = ((((try? JSONSerialization.jsonObject(with: fm.contents(atPath: home + "/.codex/hooks.json") ?? Data())) as? [String: Any])?["hooks"] as? [String: Any])?["Stop"] as? [Any])?.count
+                        check(mineKept == 2, "the user's own Codex hook is kept next to ours")
+                        check(advTitles().contains("无任务") && c.header.title == "AI 智能模式待命", "no task: \(c.header.title)")
+                        check(widthsFixed(), "fixed menu widths (AI standby)")
+                        c.agentEvent(ev(.codex, "a", .responding, 1))
+                        check(c.decision == Decision(want: true, hold: nil, auto: true) && c.busy, "a Codex task starts: AI keeps the Mac awake by itself, no click needed")
+                    }),
+                    (wait, {
+                        check(c.current == on && c.intent == false && c.leaseStore.exists && c.guardRunning, "AI enabled all parts; the manual choice stays off")
+                        check(c.header.title == "AI 合盖运行中" && c.header.toolTip == "AI 合盖运行中 · 1 个任务" && c.toggle.title == "关闭合盖运行", "header shows AI keep-awake: \(c.header.title)")
+                        check(widthsFixed(), "fixed menu widths (AI running)")
+                        c.settleAnimation()
+                        check(c.shown == Look(lidClosed: true, lit: true), "AI keep-awake uses the lit Mac Studio icon")
+                        writes = 0
+                        c.agentEvent(ev(.gemini, "b", .waiting, 1))
+                        c.agentEvent(ev(.antigravity, "c", .background, 1))
+                        c.agentEvent(ev(.codex, "a2", .tool, 1))
+                        let byKind = c.tracker.countsByKind(now: fake)
+                        check(byKind[.codex] == AgentCount(running: 2) && byKind[.gemini] == AgentCount(waiting: 1) && byKind[.antigravity] == AgentCount(background: 1), "per-agent counts")
+                        let lines = advTitles()
+                        check(lines.contains("Codex：2 个进行中") && lines.contains("Gemini：1 个待确认") && lines.contains("Antigravity：1 个后台"), "submenu lists the background tasks per agent: \(lines)")
+                        check(widthsFixed(), "fixed menu widths (several agent task lines)")
+                        c.menuWillOpen(c.advancedMenu)
+                        c.agentEvent(ev(.codex, "a2", .turnDone, 2))
+                        check(c.advancedMenu.items.contains { $0.title == "Codex：1 个进行中" }, "an open submenu updates on agent events (no timer)")
+                        c.menuDidClose(c.advancedMenu)
+                        let finished: [(AgentKind, String)] = [(.codex, "a"), (.gemini, "b"), (.antigravity, "c")]
+                        for (k, s) in finished { c.agentEvent(ev(k, s, .turnDone, 3)) }
+                        check(c.decision == Decision(want: true, hold: nil, auto: true) && c.policyTimer != nil && writes == 0, "all done: the 3-minute buffer is one one-shot timer")
+                        check(advTitles().contains { $0.hasPrefix("约 ") && $0.hasSuffix(" 睡眠") }, "buffer is shown")
+                        check(widthsFixed(), "fixed menu widths (buffer line)")
+                        advance(120)
+                        c.agentEvent(ev(.codex, "d", .responding, 4))
+                        advance(200); c.deadlineFired()
+                        check(c.decision.want == true && writes == 0, "a new task inside the buffer cancels the pending sleep")
+                        c.agentEvent(ev(.codex, "d", .turnDone, 5))
+                        c.lidReader = { true }; c.idleReader = { 600 }; sleeps = 0
+                        advance(179); c.deadlineFired()
+                        check(c.decision.want == true && !c.busy, "still inside the buffer at 179 s")
+                        advance(2); c.deadlineFired()
+                        check(c.decision == Decision(want: false, hold: .smartIdle) && c.busy, "buffer over: AI releases keep-awake by itself")
+                    }),
+                    (wait, {
+                        check(c.current == off && !c.leaseStore.exists && !c.guardRunning && c.intent == false, "released all parts and the lease")
+                        check(sleeps == 1, "lid closed and nobody at the Mac: sleep right away (pmset sleepnow, no root)")
+                        check(c.header.title == "AI 智能模式待命" && c.toggle.title == "开启合盖运行" && c.policyTimer == nil, "standby with nothing pending: no timer: \(c.header.title)")
+                        c.settleAnimation(); writes = 0
+                        c.agentEvent(ev(.codex, "e", .responding, 6))
+                        check(c.busy, "the next task re-enables by itself")
+                    }),
+                    (wait, {
+                        check(c.current == on, "re-enabled")
+                        c.settleAnimation()
+                        c.lidReader = { false }; sleeps = 0
+                        c.agentEvent(ev(.codex, "e", .turnDone, 7))
+                        advance(181); c.deadlineFired()
+                        check(c.busy, "released again")
+                    }),
+                    (wait, {
+                        check(c.current == off && sleeps == 0, "lid open: keep-awake released, but no forced sleep")
+                        c.lidReader = { true }; c.idleReader = { 5 }
+                        c.agentEvent(ev(.codex, "f", .responding, 8))
+                    }),
+                    (wait, {
+                        check(c.current == on, "on for task f")
+                        c.settleAnimation()
+                        c.agentEvent(ev(.codex, "f", .turnDone, 9)); advance(181); c.deadlineFired()
+                    }),
+                    (wait, {
+                        check(c.current == off && sleeps == 0, "lid closed but someone used the Mac a moment ago (external keyboard): no forced sleep")
+                        c.idleReader = { 600 }
+                        c.agentEvent(ev(.codex, "g", .responding, 10))
+                    }),
+                    (wait, {
+                        check(c.current == on, "on for task g")
+                        c.settleAnimation()
+                        c.toggleMode()
+                        check(c.suppressed && c.intent == false, "manual off during a task: AI paused for this batch")
+                    }),
+                    (wait, {
+                        check(c.current == off && c.header.title == "AI 已暂停" && sleeps == 0, "manual off is immediate and explicit: \(c.header.title)")
+                        check(widthsFixed(), "fixed menu widths (AI paused)")
+                        writes = 0
+                        c.agentEvent(ev(.gemini, "h", .tool, 1)); c.accept(.success(off))
+                        check(writes == 0 && !c.busy, "while paused, more activity in this batch never re-enables")
+                        c.agentEvent(ev(.codex, "g", .turnDone, 11)); c.agentEvent(ev(.gemini, "h", .turnDone, 2))
+                        check(!c.suppressed && c.decision == Decision(want: false, hold: .smartIdle) && c.policyTimer == nil && writes == 0, "batch over: pause ends, no buffer, nothing written")
+                        c.agentEvent(ev(.codex, "i", .responding, 12))
+                        check(c.busy, "the next batch enables by itself again")
+                    }),
+                    (wait, {
+                        check(c.current == on, "next batch on")
+                        c.settleAnimation()
+                        c.toggleSmart()
+                        check(!c.smartMode && c.busy, "AI smart mode off: keep-awake follows the manual choice (off)")
+                    }),
+                    (wait, {
+                        check(c.current == off && target(.codex).status() == .installed, "turning AI off keeps the invisible hooks (the helper exits at once without the socket)")
+                        check(advTitles().filter { $0.contains("任务") }.isEmpty, "no task lines while AI smart mode is off")
+                        writes = 0
+                        c.agentEvent(ev(.codex, "j", .responding, 13))
+                        check(writes == 0 && !c.busy, "AI off: agent events are ignored")
+                        c.toggleMode()
+                    }),
+                    (wait, {
+                        check(c.current == on && c.leaseStore.exists, "manual on again")
+                        writes = 0
+                        c.releaseOwnedSleep()
+                        check(!powerOn && writes == 1 && !c.leaseStore.exists, "quit turns off a SleepDisabled this app owns")
+                        powerOn = true; writes = 0
+                        c.releaseOwnedSleep()
+                        check(powerOn && writes == 0, "quit never touches a SleepDisabled it does not own")
+                        c.leaseStore.write(KeepAwakeLease(pid: 999_999, processStart: 1, bootSession: bootSessionUUID(), since: Date(timeIntervalSince1970: 1_800_000_000)))
+                        c.recoverLeaseAtLaunch()
+                        check(c.leaseStore.read()?.pid == getpid(), "launch adopts a lease left by an instance that ended without releasing")
+                        let mine = KeepAwakeLease(pid: getpid(), processStart: processStartTime(getpid()) ?? 0, bootSession: bootSessionUUID(), since: Date(timeIntervalSince1970: 1_800_000_000))
+                        c.leaseStore.write(mine); c.recoverLeaseAtLaunch()
+                        check(c.leaseStore.read() == mine, "a live owner's lease is left alone")
+                        c.leaseStore.remove()
+                        closedOn = true; unlockedOn = true; powerOn = false; writes = 0
+                        c.accept(.success(ModeState(closed: true, unlocked: true, power: false)))
+                        check(c.busy, "the saved manual choice is restored automatically, as in 1.4.1")
+                    }),
+                    (wait, {
+                        check(c.current == on && writes == 1, "restored only the changed part")
+                        let one = NSMenuItem(); one.tag = 1
+                        c.setAutoStop(one)
+                        check(c.autoStopAt != nil && c.policyTimer != nil, "timed stop arms a single timer")
+                        advance(3601); c.settleAnimation(); c.deadlineFired()
+                        check(c.intent == false && c.busy, "timed stop turns the mode off like an explicit off")
+                    }),
+                    (wait, {
+                        check(c.current == off && c.policyTimer == nil, "after the timed stop nothing is pending")
+                        c.settleAnimation()
+                        check(c.link == nil && c.overlay == nil, "no display link or overlay at rest")
+                        // Codex system-level hooks (trusted by policy): the user-level copy goes away, so Codex never runs them twice.
+                        let sysDir = (c.codexSystemPath as NSString).deletingLastPathComponent
+                        if case .write(let data) = CodexSystemHooks.plan(install: true, helper: c.helperPath, path: c.codexSystemPath) {
+                            try? fm.createDirectory(atPath: sysDir, withIntermediateDirectories: true)
+                            _ = fm.createFile(atPath: c.codexSystemPath, contents: data)
+                        }
+                        c.ensureHooks()
+                        let userCodexRoot = (try? JSONSerialization.jsonObject(with: fm.contents(atPath: home + "/.codex/hooks.json") ?? Data())) as? [String: Any] ?? [:]
+                        let userStop = ((userCodexRoot["hooks"] as? [String: Any])?["Stop"] as? [Any])?.count
+                        check(CodexSystemHooks.isActive(helper: c.helperPath, path: c.codexSystemPath) && target(.codex).status() == .notInstalled && userStop == 1,
+                              "Codex system hooks active: our user-level copy is removed (no double runs), the user's own hook stays")
+                        try? fm.removeItem(atPath: sysDir)
+                    }),
+                    ]
+                    seq(v2Steps) {
+                        c.defaults.removePersistentDomain(forName: Controller.selftestSuite)
+                        c.leaseStore.remove()
+                        try? FileManager.default.removeItem(atPath: scratch)
+                        print("PASS \(assertions) assertions; rendered close=\(c.renderedCloseFrames), open=\(c.renderedOpenFrames), halo=\(c.renderedHaloFrames); real status-button animation path, mocked writes only")
+                        NSApp.terminate(nil)
+                    }
                 }
             }
         }

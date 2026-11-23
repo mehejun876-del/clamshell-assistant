@@ -3,3 +3,8 @@ ClamshellAssistant
 *.app
 *.zip
 AppIcon-preview.png
+dist/
+backups/
+.DS_Store
+measurements/
+incoming/
