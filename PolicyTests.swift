@@ -264,29 +264,55 @@ func runPolicyTests(_ expect: (Bool, String) -> Void) {
     try? fm.removeItem(atPath: home)
 
     // ---- Agents without hooks: AWS Quick's log tags, Codex's state, Codex Keyboard ------------
-    expect(quickLogPhase("[2026-11-23T10:15:55Z] [INFO] [rlog:outpost_tool_call_started] {\"event\":1}") == .responding
-           && quickLogPhase("[x] [INFO] [OutpostACP] progress") == .responding
-           && quickLogPhase("[x] [INFO] [ChatTurn] time_to_complete 1234") == .turnDone
-           && quickLogPhase("[x] [INFO] [NookAuth] nook-invoke-agent called") == nil, "AWS Quick: only fixed tags are recognised")
-    expect(quickLogLastPhase("a [TTFT] time_to_first_token\nb [ChatTurn] time_to_complete\n") == .turnDone
-           && quickLogLastPhase("a [ChatTurn] time_to_complete\nb [rlog:outpost_tool_call_finished]\n") == .responding
-           && quickLogLastPhase("nothing here\n") == nil, "AWS Quick: the newest tag in a chunk wins")
+    let quickHeader = "[2026-11-23T10:15:55.123Z] [INFO] "
+    let acpHeader = quickHeader + "[Agent] 2026-11-23T10:15:55.100Z INFO  [aws_quick_work.qw_outpost._acp] [-] [trace=-] [session=-] [OutpostACP] "
+    let toolID = "10000000-0000-4000-8000-000000000001"
+    let acpID = "10000000-0000-4000-8000-000000000002"
+    func deviceTool(_ event: String, _ tool: String = "run_python_outpost_local") -> String {
+        quickHeader + "[rlog:outpost_tool_call_\(event)] {\"tool_name\":\"\(tool)\",\"tool_call_id\":\"\(toolID)\"}"
+    }
+    let toolStart = deviceTool("started")
+    let toolFinish = deviceTool("finished")
+    let acpStart = acpHeader + "session \(acpID): turn \(toolID) acked (ack_mode)"
+    let acpFinish = acpHeader.replacingOccurrences(of: "qw_outpost._acp]", with: "qw_outpost.acp_progress_batcher]")
+        + "progress batching session=\(acpID) updates_in=9 frames_out=9"
+    let cloudDone = quickHeader + "[ChatTurn] time_to_complete {\"e2e_ms\":1000}"
+    let ignored = [cloudDone, quickHeader + "[TTFT] time_to_first_token {}", deviceTool("started", "acp__get_session"),
+                   deviceTool("finished", "acp__send"), acpHeader + "permission request parked+emitted"]
+    expect(ignored.allSatisfy { QuickLogActivity($0[...]) == nil },
+           "AWS Quick: cloud metrics, dispatch acknowledgement tools and permission chatter don't create work")
+    let operationEvents = [toolStart, acpStart, toolFinish, acpFinish].compactMap { QuickLogActivity($0[...]) }
+    expect(operationEvents.map(\.phase) == [.responding, .responding, .turnDone, .turnDone],
+           "AWS Quick: a device tool and a delegated ACP turn have independent starts and ends")
+    var quickTracker = AgentTracker()
+    for (i, event) in operationEvents.enumerated() {
+        quickTracker.apply(AgentEvent(kind: .quick, session: event.session, phase: event.phase, sentAt: Double(i)), now: at(Double(i)))
+        if i == 2 {
+            expect(quickTracker.countsByKind(now: at(2))[.quick] == AgentCount(running: 1),
+                   "AWS Quick: finishing a direct device tool doesn't end the delegated turn")
+        }
+    }
+    expect(!quickTracker.keepsAwake(now: at(3)) && quickTracker.idleSince == at(3), "AWS Quick: buffer begins after the last local operation")
     let qdir = NSTemporaryDirectory() + "clamshell-selftest-quicklog-\(getpid())"
     try? FileManager.default.removeItem(atPath: qdir)
     try? FileManager.default.createDirectory(atPath: qdir, withIntermediateDirectories: true)
-    _ = FileManager.default.createFile(atPath: qdir + "/quickwork-2026-11-23-10.log", contents: Data("old [rlog:outpost_tool_call_started]\n".utf8))
-    var phases: [AgentPhase] = []
-    let qm = QuickLogMonitor(dir: qdir) { phases.append($0) }
+    let firstLog = qdir + "/quickwork-2026-11-23-10.log"
+    _ = FileManager.default.createFile(atPath: firstLog, contents: Data((toolStart + "\n").utf8))
+    var activities: [QuickLogActivity] = []
+    let qm = QuickLogMonitor(dir: qdir) { activities.append($0) }
     qm.start()
     qm.changed()
-    expect(phases.isEmpty, "AWS Quick: lines written before launch are never replayed")
-    if let h = FileHandle(forWritingAtPath: qdir + "/quickwork-2026-11-23-10.log") {
-        h.seekToEndOfFile(); h.write(Data("x [INFO] [rlog:outpost_tool_call_started] {}\n".utf8)); try? h.close()
+    expect(activities.isEmpty, "AWS Quick: lines written before launch are never replayed")
+    if let h = FileHandle(forWritingAtPath: firstLog) {
+        h.seekToEndOfFile(); h.write(Data((toolStart + "\n" + acpStart).utf8))
+        qm.changed()
+        expect(activities == Array(operationEvents.prefix(1)), "AWS Quick: waits for a complete log line")
+        h.write(Data(("\n" + toolFinish + "\n").utf8)); try? h.close()
     }
+    _ = FileManager.default.createFile(atPath: qdir + "/quickwork-2026-11-23-11.log", contents: Data((cloudDone + "\n" + acpFinish + "\n").utf8))
     qm.changed()
-    _ = FileManager.default.createFile(atPath: qdir + "/quickwork-2026-11-23-11.log", contents: Data("y [ChatTurn] time_to_complete\n".utf8))
-    qm.changed()
-    expect(phases == [.responding, .turnDone] && qm.file?.hasSuffix("-11.log") == true, "AWS Quick: appended lines are read, and the next hour's file from its start")
+    expect(activities == operationEvents && qm.file?.hasSuffix("-11.log") == true,
+           "AWS Quick: drains complete records from both sides of rotation in order")
     qm.stop()
     try? FileManager.default.removeItem(atPath: qdir)
 

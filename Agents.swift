@@ -425,22 +425,54 @@ enum CodexSystemHooks {
 // handler then reads just what it needs. No timer, no polling, no process scanning, and no
 // prompt, reply or file content is ever kept.
 
-/// AWS Quick runs in the cloud and needs this Mac only while it works on it (local files, local
-/// code, local coding agents). Its desktop log marks those moments; only these tags are read.
-func quickLogPhase(_ line: Substring) -> AgentPhase? {
-    if line.contains("[ChatTurn] time_to_complete") { return .turnDone }
-    if line.contains("[rlog:outpost_tool_call_started]") || line.contains("[rlog:outpost_tool_call_finished]")
-        || line.contains("[OutpostACP]") || line.contains("[ChatTurn] time_to_first") || line.contains("[TTFT]") { return .responding }
-    return nil
-}
+struct QuickLogActivity: Equatable {
+    let session: String
+    let phase: AgentPhase
 
-/// The newest relevant phase in a chunk of appended log text; nil when nothing in it matters.
-func quickLogLastPhase(_ text: String) -> AgentPhase? {
-    var last: AgentPhase? = nil
-    for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
-        if let p = quickLogPhase(line) { last = p }
+    private static let deviceTools: Set<String> = [
+        "run_python_outpost_local", "run_python_outpost_local_with_write",
+        "file_download", "file_upload", "file_matches", "ripgrep", "folder_list", "open_file", "fdfind"
+    ]
+
+    /// Track local operations by ID. Cloud turn metrics and ACP session queries do not indicate local work.
+    init?(_ line: Substring) {
+        guard line.first == "[", let timestampEnd = line.firstIndex(of: "]") else { return nil }
+        let header = line[line.index(after: timestampEnd)...]
+        let start = " [INFO] [rlog:outpost_tool_call_started] "
+        let finish = " [INFO] [rlog:outpost_tool_call_finished] "
+        if header.hasPrefix(start) || header.hasPrefix(finish) {
+            let starting = header.hasPrefix(start)
+            let payload = header.dropFirst(starting ? start.count : finish.count)
+            guard let data = try? JSONSerialization.jsonObject(with: Data(payload.utf8)) as? [String: Any],
+                  let tool = data["tool_name"] as? String, Self.deviceTools.contains(tool),
+                  let id = data["tool_call_id"] as? String, let uuid = UUID(uuidString: id) else { return nil }
+            session = "tool:" + uuid.uuidString
+            phase = starting ? .responding : .turnDone
+            return
+        }
+        guard header.hasPrefix(" [INFO] [Agent] "),
+              let marker = header.range(of: "[OutpostACP] ") else { return nil }
+        let logger = header[..<marker.lowerBound]
+        let fields = header[marker.upperBound...].split(separator: " ")
+        if logger.contains("[aws_quick_work.qw_outpost._acp]"),
+           fields.count == 6, fields[0] == "session", fields[1].hasSuffix(":"),
+           fields[2] == "turn", UUID(uuidString: String(fields[3])) != nil,
+           fields[4] == "acked", fields[5] == "(ack_mode)",
+           let uuid = UUID(uuidString: String(fields[1].dropLast())) {
+            session = "acp:" + uuid.uuidString
+            phase = .responding
+        } else if logger.contains("[aws_quick_work.qw_outpost.acp_progress_batcher]"),
+                  fields.count == 5, fields[0] == "progress", fields[1] == "batching",
+                  fields[2].hasPrefix("session="), fields[3].hasPrefix("updates_in="),
+                  fields[4].hasPrefix("frames_out="),
+                  let uuid = UUID(uuidString: String(fields[2].dropFirst("session=".count))) {
+            // Quick emits this summary once when the local ACP turn finishes.
+            session = "acp:" + uuid.uuidString
+            phase = .turnDone
+        } else {
+            return nil
+        }
     }
-    return last
 }
 
 /// Codex keeps the turns running right now in its own database (Codex app and ChatGPT's Codex,
@@ -536,10 +568,10 @@ final class QuickLogMonitor {
     private(set) var file: String?
     private var offset: UInt64 = 0
     private var watcher: FileChangeWatcher?
-    private let onPhase: (AgentPhase) -> Void
+    private let onActivity: (QuickLogActivity) -> Void
 
-    init(dir: String = NSHomeDirectory() + "/Library/Logs/quickwork", onPhase: @escaping (AgentPhase) -> Void) {
-        self.dir = dir; self.onPhase = onPhase
+    init(dir: String = NSHomeDirectory() + "/Library/Logs/quickwork", onActivity: @escaping (QuickLogActivity) -> Void) {
+        self.dir = dir; self.onActivity = onActivity
     }
 
     /// File names carry the date and hour, so the largest name is the newest file.
@@ -567,16 +599,28 @@ final class QuickLogMonitor {
     }
 
     func changed() {
-        if Self.newestLog(in: dir) != file { attach(fromStart: true) }      // a new hour began: read it from its start
+        readAppendedLines()
+        if Self.newestLog(in: dir) != file {
+            attach(fromStart: true)
+            readAppendedLines()
+        }
+    }
+
+    private func readAppendedLines() {
         guard let f = file, let h = FileHandle(forReadingAtPath: f) else { return }
         defer { try? h.close() }
         let end = h.seekToEndOfFile()
         if end < offset { offset = 0 }
+        let previousOffset = offset
         let start = max(offset, end > 512 * 1024 ? end - 512 * 1024 : 0)
         h.seek(toFileOffset: start)
         let data = h.readData(ofLength: Int(end - start))
-        offset = end
-        if let p = quickLogLastPhase(String(decoding: data, as: UTF8.self)) { onPhase(p) }
+        guard let lastNewline = data.lastIndex(of: 10) else { return }
+        offset = start + UInt64(lastNewline + 1)
+        let lines = String(decoding: data[...lastNewline], as: UTF8.self).split(separator: "\n", omittingEmptySubsequences: false)
+        for line in lines.dropFirst(start > previousOffset ? 1 : 0) {
+            if let activity = QuickLogActivity(line) { onActivity(activity) }
+        }
     }
 }
 

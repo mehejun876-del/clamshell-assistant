@@ -1017,7 +1017,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func startStateMonitors() {
         #if !SELFTEST
-        if quickMonitor == nil { let q = QuickLogMonitor { [weak self] p in self?.quickPhase(p) }; q.start(); quickMonitor = q }
+        if quickMonitor == nil {
+            let q = QuickLogMonitor { [weak self] activity in self?.quickActivity(activity) }
+            q.start(); quickMonitor = q
+        }
         if codexMonitor == nil {
             let c = CodexStateMonitor(home: hookHome) { [weak self] l, k in self?.codexSnapshot(local: l, keyboard: k) }
             c.start(); codexMonitor = c
@@ -1030,8 +1033,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         codexLocalIDs = []; codexKeyboardIDs = []
     }
 
-    func quickPhase(_ p: AgentPhase) {
-        agentEvent(AgentEvent(kind: .quick, session: hashSession("aws-quick-desktop"), phase: p, sentAt: (clock().timeIntervalSince1970 * 1000).rounded()))
+    func quickActivity(_ activity: QuickLogActivity) {
+        agentEvent(AgentEvent(kind: .quick, session: hashSession(activity.session), phase: activity.phase, sentAt: (clock().timeIntervalSince1970 * 1000).rounded()))
     }
 
     /// nil = that source cannot be read right now: keep what it said last.

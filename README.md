@@ -32,7 +32,7 @@
   | Antigravity | 官方 Hook（`~/.gemini/config/hooks.json`） |
   | Kiro（CLI / IDE） | 官方 Hook（`~/.kiro/hooks/clamshell-assistant.json`，只注册不会阻塞 Kiro 的被动事件） |
   | Grok Build | 官方 Hook（`~/.grok/hooks/`，装了才连接） |
-  | AWS Quick 桌面版 | 只认桌面日志 `~/Library/Logs/quickwork/` 里的几个固定标签（本机工具调用、调用本机编程助手、一轮开始 / 结束），不读内容 |
+  | AWS Quick 桌面版 | 从 `~/Library/Logs/quickwork/` 中按 ID 配对本机工具调用和 ACP 编程回合的开始、结束，只使用事件元数据 |
 
   Hook 通过本机 Unix Domain Socket 上报（目录 0700、socket 0600，同用户校验，只接受应用内置的 helper）。不记录提示词、回复、工具参数或路径；会话 ID 只保存哈希值。
 - **Hook 不需要你管**：AI 智能模式开着时，助手自己为已安装的 Agent 追加 Hook（先备份为 `.clamshell-backup-时间戳`，不覆盖你的条目，带注释等非标准 JSON 的配置不动）。Codex 的系统级 Hook 由安装脚本写入，需要一次管理员密码。`rollback.sh` 只移除本助手的条目。
@@ -47,7 +47,7 @@
 ### 不能保证的部分
 - Gemini 桌面 App 和 Grok Bot 没有本机接口，不识别。Grok Bot 的任务在云端电脑上运行，不受 Mac 睡眠影响。
 - 纯远程运行的 Codex Work 不识别（它在云端执行，不受 Mac 睡眠影响）。
-- AWS Quick 的识别依赖它的桌面日志格式，App 更新后可能失效；它只在云端思考、没有操作你的电脑时不计为任务。
+- AWS Quick 的识别依赖它的桌面日志格式。云端生成和查询编程会话状态不计为本机任务。若本机回合缺少结束日志，现有任务租约到期后会清除状态。
 - Antigravity 没有“等待确认”和“中断”事件，Gemini CLI 没有“中断”事件；这类情况靠租约到期处理（先显示“未知”，再到期）。
 - 同一用户下的其他程序可以伪造调用内置 helper，但影响有上限：只能在会话上限内延长保持唤醒的时间，不能覆盖你的明确关闭。
 - 断电、内核崩溃、注销时守护进程也会结束，这时只能靠“下次启动恢复”。
